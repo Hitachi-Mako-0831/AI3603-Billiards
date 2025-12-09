@@ -12,6 +12,7 @@ evaluate.py - Agent 评估脚本
 3. 运行脚本查看结果
 """
 
+import argparse
 import math
 import pooltool as pt
 import numpy as np
@@ -20,15 +21,56 @@ import copy
 import os
 from datetime import datetime
 import random
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+TRAIN_DIR = SCRIPT_DIR / "train"
+if str(TRAIN_DIR) not in sys.path:
+    sys.path.append(str(TRAIN_DIR))
 
 from poolenv import PoolEnv
 from agent import Agent, BasicAgent, NewAgent
+from sac import SACAgent  # type: ignore
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate trained SAC agent against baseline")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/sac_agent.pth", help="路径：待评估 SAC 模型 checkpoint")
+    parser.add_argument("--games", type=int, default=40, help="评估局数")
+    return parser.parse_args()
+
+
+def build_trained_agent(checkpoint_path: str) -> SACAgent:
+    checkpoint_file = Path(checkpoint_path)
+    config_override = None
+    if checkpoint_file.is_file():
+        payload = None
+        try:
+            import torch
+            payload = torch.load(checkpoint_file, map_location="cpu", weights_only=False)
+            config_override = payload.get("config")
+            print(f"[Evaluate] 已找到 checkpoint: {checkpoint_file}")
+        except Exception as exc:
+            print(f"[Evaluate] 读取 checkpoint 失败，继续使用默认配置：{exc}")
+        finally:
+            payload = None
+    else:
+        print(f"[Evaluate] 未找到 checkpoint: {checkpoint_file}，将以随机初始化权重评估。")
+
+    if config_override is not None:
+        return SACAgent(config=config_override, checkpoint_path=str(checkpoint_file), training=False)
+    return SACAgent(checkpoint_path=str(checkpoint_file), training=False)
+
+
+args = parse_args()
 
 env = PoolEnv()
 results = {'AGENT_A_WIN': 0, 'AGENT_B_WIN': 0, 'SAME': 0}
 n_games = 40
 
-agent_a, agent_b = BasicAgent(), NewAgent()
+agent_a = BasicAgent()
+agent_b = build_trained_agent(args.checkpoint)
 
 players = [agent_a, agent_b]  # 用于切换先后手
 target_ball_choice = ['solid', 'solid', 'stripe', 'stripe']  # 轮换球型
