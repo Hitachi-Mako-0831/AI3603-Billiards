@@ -44,7 +44,6 @@ def values_are_finite(name: str, value) -> bool:
 	arr = np.asarray(value, dtype=np.float32)
 	if np.all(np.isfinite(arr)):
 		return True
-	print(f"[Safety] {name} contains non-finite values: {arr}")
 	return False
 
 
@@ -56,7 +55,7 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--checkpoint", type=str, default="checkpoints/sac_agent.pth", help="checkpoint path")
 	parser.add_argument("--log-dir", type=str, default="logs", help="log path")
 	parser.add_argument("--save-every", type=int, default=5, help="how many echos we save the model")
-	parser.add_argument("--selfplay-sync", type=int, default=5, help="episodes between syncing opponent weights")
+	parser.add_argument("--selfplay-sync", type=int, default=50, help="episodes between syncing opponent weights")
 	parser.add_argument("--seed", type=int, default=42, help="randon seed")
 	parser.add_argument("--env-noise", action="store_true", help="use the environment noise")
 	parser.add_argument("--learning-starts", type=int, default=512, help="start gradient update when buffer size reach this value")
@@ -71,6 +70,7 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--lr-alpha", type=float, default=3e-4, help="alpha learning rate")
 	parser.add_argument("--alpha", type=float, default=0.2, help="solid alpha (when forbidden auto entroy adjust)")
 	parser.add_argument("--disable-auto-entropy", action="store_true", help="diable automatic entropy adjustment")
+	parser.add_argument("--policy-update-freq", type=int, default=5, help="frequency of actor/alpha updates vs critic updates")
 	return parser.parse_args()
 
 
@@ -142,7 +142,7 @@ def main():
 	if args.selfplay_sync <= 0:
 		raise ValueError("--selfplay-sync must be positive")
 
-	env = PoolEnv()
+	env = PoolEnv(verbose=False, record_shots=False)
 	env.enable_noise = args.env_noise
 	checkpoint_base = Path(args.checkpoint)
 
@@ -157,6 +157,7 @@ def main():
 		batch_size=args.batch_size,
 		buffer_size=args.buffer_size,
 		automatic_entropy_tuning=not args.disable_auto_entropy,
+		policy_update_freq=args.policy_update_freq,
 	)
 
 	sac_agent = SACAgent(
@@ -205,8 +206,6 @@ def main():
 				break
 			action_dict, _ = sac_agent._act(state, evaluate=False)
 			action_dict, clipped = enforce_action_bounds(action_dict)
-			if clipped:
-				print(f"[Safety] Clipped action to safe bounds at episode {episode}, turn {agent_turns + 1}.")
 			if not values_are_finite("action", list(action_dict.values())):
 				aborted_episode = True
 				break

@@ -14,11 +14,12 @@ import torch.nn.functional as F
 BALL_ORDER: List[str] = ['cue'] + [str(i) for i in range(1, 16)]
 ACTION_KEYS: List[str] = ['V0', 'phi', 'theta', 'a', 'b']
 ACTION_BOUNDS: Dict[str, Tuple[float, float]] = {
-    'V0': (0.5, 8.0),
+    # Keep SAC scaling consistent with training-time safety clip bounds
+    'V0': (0.5, 6.0),
     'phi': (0.0, 360.0),
-    'theta': (0.0, 90.0),
-    'a': (-0.5, 0.5),
-    'b': (-0.5, 0.5),
+    'theta': (0.0, 80.0),
+    'a': (-0.3, 0.3),
+    'b': (-0.3, 0.3),
 }
 
 LOG_STD_MIN = -20
@@ -49,7 +50,7 @@ class SACConfig:
     batch_size: int = 64
     buffer_size: int = 100_000
     automatic_entropy_tuning: bool = True
-    policy_update_freq: int = 1
+    policy_update_freq: int = 5
 
 
 class ReplayBuffer:
@@ -309,32 +310,35 @@ class SACAgent():
         critic2_loss.backward()
         self.critic2_optimizer.step()
 
-        new_actions, log_pi, _ = self.actor.sample(states)
-        q1_new = self.critic1(states, new_actions)
-        q2_new = self.critic2(states, new_actions)
-        min_q_new = torch.min(q1_new, q2_new)
-        actor_loss = (alpha_value * log_pi - min_q_new).mean()
+        self.gradient_updates += 1
 
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
-
+        actor_loss = None
         alpha_loss = None
-        if self.automatic_entropy_tuning:
-            alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
-            self.alpha_optim.zero_grad()
-            alpha_loss.backward()
-            self.alpha_optim.step()
-            self.alpha = self.log_alpha.exp()
+        if self.gradient_updates % self.config.policy_update_freq == 0:
+            new_actions, log_pi, _ = self.actor.sample(states)
+            q1_new = self.critic1(states, new_actions)
+            q2_new = self.critic2(states, new_actions)
+            min_q_new = torch.min(q1_new, q2_new)
+            actor_loss = (alpha_value * log_pi - min_q_new).mean()
+
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            self.actor_optimizer.step()
+
+            if self.automatic_entropy_tuning:
+                alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
+                self.alpha_optim.zero_grad()
+                alpha_loss.backward()
+                self.alpha_optim.step()
+                self.alpha = self.log_alpha.exp()
 
         self._soft_update(self.critic1, self.critic1_target)
         self._soft_update(self.critic2, self.critic2_target)
 
-        self.gradient_updates += 1
         return {
             'critic1_loss': float(critic1_loss.item()),
             'critic2_loss': float(critic2_loss.item()),
-            'actor_loss': float(actor_loss.item()),
+            'actor_loss': float(actor_loss.item()) if actor_loss is not None else None,
             'alpha_loss': float(alpha_loss.item()) if alpha_loss is not None else None,
             'alpha': float(self.alpha.item()) if isinstance(self.alpha, torch.Tensor) else float(self.alpha),
         }
