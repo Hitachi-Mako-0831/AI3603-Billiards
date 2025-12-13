@@ -75,12 +75,16 @@ def restore_balls_state(saved_state):
 class PoolEnv():
     """台球对战环境"""
     
-    def __init__(self):
+    def __init__(self, verbose: bool = True, record_shots: bool = True):
         """初始化环境（需调用 reset() 后才能使用）"""
         # 桌面和球
         self.table = None
         self.balls = None
         self.cue = None
+
+        # 日志与记录控制
+        self.verbose = verbose
+        self.record_shots = record_shots
 
         # A和B方的球的ID
         self.player_targets = None
@@ -110,6 +114,10 @@ class PoolEnv():
             'b': 0.003        # 纵向偏移标准差 球半径的比例（无量纲）
         }
         self.enable_noise = True  # 是否启用噪声
+
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(msg)
 
     def get_observation(self, player=None):
         """
@@ -276,23 +284,24 @@ class PoolEnv():
             noisy_action['b'] = np.clip(noisy_action['b'], -0.5, 0.5)
             
             # 打印原始和噪声后的action（可选）
-            print(f"Player {self.get_curr_player()} 原始动作: V0={action['V0']:.2f}, phi={action['phi']:.2f}, "
-                  f"theta={action['theta']:.2f}°, a={action['a']:.3f}, b={action['b']:.3f}")
-            print(f"Player {self.get_curr_player()} 实际动作: V0={noisy_action['V0']:.2f}, phi={noisy_action['phi']:.2f}, "
-                  f"theta={noisy_action['theta']:.2f}°, a={noisy_action['a']:.3f}, b={noisy_action['b']:.3f}")
+            self._log(f"Player {self.get_curr_player()} 原始动作: V0={action['V0']:.2f}, phi={action['phi']:.2f}, "
+                    f"theta={action['theta']:.2f}°, a={action['a']:.3f}, b={action['b']:.3f}")
+            self._log(f"Player {self.get_curr_player()} 实际动作: V0={noisy_action['V0']:.2f}, phi={noisy_action['phi']:.2f}, "
+                    f"theta={noisy_action['theta']:.2f}°, a={noisy_action['a']:.3f}, b={noisy_action['b']:.3f}")
             
             action = noisy_action
         else:
             # 不启用噪声时，打印原始action
-            print(f"Player {self.get_curr_player()} 执行指定动作: V0={action['V0']:.2f}, phi={action['phi']:.2f}, "
-                  f"theta={action['theta']:.2f}°, a={action['a']:.3f}, b={action['b']:.3f}")
+            self._log(f"Player {self.get_curr_player()} 执行指定动作: V0={action['V0']:.2f}, phi={action['phi']:.2f}, "
+                    f"theta={action['theta']:.2f}°, a={action['a']:.3f}, b={action['b']:.3f}")
 
         # 实现击球，通过物理仿真获得击球后的球位置信息
         shot = pt.System(table=self.table, balls=self.balls, cue=self.cue)
         self.cue.set_state(V0=action["V0"], phi=action["phi"], theta=action["theta"], a=action['a'], b=action['b'])
         pt.simulate(shot, inplace=True)
         # 记录所有shot，用于游戏结束后进行render
-        self.shot_record.append(copy.deepcopy(shot))
+        if self.record_shots:
+            self.shot_record.append(copy.deepcopy(shot))
 
         # 获取 final_states
         # final_states = collect_ball_states(shot)
@@ -329,15 +338,15 @@ class PoolEnv():
 
         # 白球和黑8同时落袋即可直接判负
         if "cue" in new_pocketed and "8" in new_pocketed:
-            print(f"⚪+🎱 白球和黑8同时落袋,犯规!判负！")
-            print(f"🏆 Player {self.players[1 - self.curr_player]} 获胜！")
+            self._log(f"⚪+🎱 白球和黑8同时落袋,犯规!判负！")
+            self._log(f"🏆 Player {self.players[1 - self.curr_player]} 获胜！")
             self.done = True
             self.winner = self.players[1 - self.curr_player]
             return {'ME_INTO_POCKET': own_pocketed, 'ENEMY_INTO_POCKET': enemy_pocketed, 'WHITE_BALL_INTO_POCKET': True, 'BLACK_BALL_INTO_POCKET': True, 'FOUL_FIRST_HIT': False, 'NO_POCKET_NO_RAIL': False, 'BALLS': copy.deepcopy(self.balls)}
 
         # 白球掉袋 (犯规)
         if "cue" in new_pocketed:
-            print("⚪ 白球落袋！犯规，恢复上一杆状态，交换球权。")
+            self._log("⚪ 白球落袋！犯规，恢复上一杆状态，交换球权。")
             # 保存击打前的balls状态用于返回
             balls_before_shot = copy.deepcopy(self.last_state)
             self.balls = restore_balls_state(self.last_state)
@@ -345,7 +354,7 @@ class PoolEnv():
             self.done = False
             self.hit_count += 1
             if self.hit_count >= self.MAX_HIT_COUNT:
-                print(f"⏰ 达到最大击球数，比赛结束！")
+                self._log(f"⏰ 达到最大击球数，比赛结束！")
                 self.done = True
                 a_left = len([bid for bid in self.player_targets["A"] if bid != '8' and self.balls[bid].state.s != 4])
                 b_left = len([bid for bid in self.player_targets["B"] if bid != '8' and self.balls[bid].state.s != 4])
@@ -355,7 +364,7 @@ class PoolEnv():
                     self.winner = "B"
                 else:
                     self.winner = "SAME"
-                print(f"📊 最大击球数详情：A剩余 {a_left}，B剩余 {b_left}，胜者：{self.winner}")
+                self._log(f"📊 最大击球数详情：A剩余 {a_left}，B剩余 {b_left}，胜者：{self.winner}")
             return {'ME_INTO_POCKET': own_pocketed, 'ENEMY_INTO_POCKET': enemy_pocketed, 'WHITE_BALL_INTO_POCKET': True, 'BLACK_BALL_INTO_POCKET': False, 'FOUL_FIRST_HIT': False, 'NO_POCKET_NO_RAIL': False, 'BALLS': balls_before_shot}
         
         player = self.get_curr_player()
@@ -366,22 +375,22 @@ class PoolEnv():
             remaining_own = [bid for bid in self.player_targets[player] if self.balls[bid].state.s != 4]
             
             if len(remaining_own) == 0:
-                print(f"🏆 Player {player} 成功打进黑8，获胜！")
+                self._log(f"🏆 Player {player} 成功打进黑8，获胜！")
                 self.winner = self.players[self.curr_player]
             else:
-                print(f"💥 Player {player} 误打黑8（自身球未清空），判负！")
-                print(f"🏆 Player {self.players[1 - self.curr_player]} 获胜！")
+                self._log(f"💥 Player {player} 误打黑8（自身球未清空），判负！")
+                self._log(f"🏆 Player {self.players[1 - self.curr_player]} 获胜！")
                 self.winner = self.players[1 - self.curr_player]
             self.done = True
             return {'ME_INTO_POCKET': own_pocketed, 'ENEMY_INTO_POCKET': enemy_pocketed, 'WHITE_BALL_INTO_POCKET': False, 'BLACK_BALL_INTO_POCKET': True, 'FOUL_FIRST_HIT': False, 'NO_POCKET_NO_RAIL': False, 'BALLS': copy.deepcopy(self.balls)}
 
         if first_contact_ball_id is None:
-            print(f"⚠️ 本杆白球未接触任何球，交换球权。")
+            self._log(f"⚠️ 本杆白球未接触任何球，交换球权。")
             self.curr_player = 1 - self.curr_player
             self.last_state = save_balls_state(self.balls)
             self.hit_count += 1
             if self.hit_count >= self.MAX_HIT_COUNT:
-                print(f"⏰ 达到最大击球数，比赛结束！")
+                self._log(f"⏰ 达到最大击球数，比赛结束！")
                 self.done = True
                 a_left = len([bid for bid in self.player_targets["A"] if bid != '8' and self.balls[bid].state.s != 4])
                 b_left = len([bid for bid in self.player_targets["B"] if bid != '8' and self.balls[bid].state.s != 4])
@@ -391,7 +400,7 @@ class PoolEnv():
                     self.winner = "B"
                 else:
                     self.winner = "SAME"
-                print(f"📊 最大击球数详情：Player A剩余 {a_left}，Player B剩余 {b_left}，胜者：{self.winner}")
+                self._log(f"📊 最大击球数详情：Player A剩余 {a_left}，Player B剩余 {b_left}，胜者：{self.winner}")
             return {'ME_INTO_POCKET': own_pocketed, 'ENEMY_INTO_POCKET': enemy_pocketed, 'WHITE_BALL_INTO_POCKET': False, 'BLACK_BALL_INTO_POCKET': False, 'FOUL_FIRST_HIT': False, 'NO_POCKET_NO_RAIL': False, 'NO_HIT': True, 'BALLS': copy.deepcopy(self.balls)}
 
         if first_contact_ball_id is not None:
@@ -399,12 +408,12 @@ class PoolEnv():
             if ('8' not in opponent_plus_eight):
                 opponent_plus_eight.append('8')
             if len(remaining_own_before) > 0 and first_contact_ball_id in opponent_plus_eight:
-                print(f"⚠️ Player {player} 首次碰撞为对方球或黑8，交换球权。")
+                self._log(f"⚠️ Player {player} 首次碰撞为对方球或黑8，交换球权。")
                 self.curr_player = 1 - self.curr_player
                 self.last_state = save_balls_state(self.balls)
                 self.hit_count += 1
                 if self.hit_count >= self.MAX_HIT_COUNT:
-                    print(f"⏰ 达到最大击球数，比赛结束！")
+                    self._log(f"⏰ 达到最大击球数，比赛结束！")
                     self.done = True
                     a_left = len([bid for bid in self.player_targets["A"] if bid != '8' and self.balls[bid].state.s != 4])
                     b_left = len([bid for bid in self.player_targets["B"] if bid != '8' and self.balls[bid].state.s != 4])
@@ -414,16 +423,16 @@ class PoolEnv():
                         self.winner = "B"
                     else:
                         self.winner = "SAME"
-                    print(f"📊 最大击球数详情：A剩余 {a_left}，B剩余 {b_left}，胜者：{self.winner}")
+                    self._log(f"📊 最大击球数详情：A剩余 {a_left}，B剩余 {b_left}，胜者：{self.winner}")
                 return {'ME_INTO_POCKET': own_pocketed, 'ENEMY_INTO_POCKET': enemy_pocketed, 'WHITE_BALL_INTO_POCKET': False, 'BLACK_BALL_INTO_POCKET': False, 'FOUL_FIRST_HIT': True, 'NO_POCKET_NO_RAIL': False, 'BALLS': copy.deepcopy(self.balls)}
 
         if len(new_pocketed) == 0 and ((not cue_hit_cushion) or (not target_hit_cushion)):
-            print(f"⚠️ 本杆无进球且母球或目标球未碰库，交换球权。")
+            self._log(f"⚠️ 本杆无进球且母球或目标球未碰库，交换球权。")
             self.curr_player = 1 - self.curr_player
             self.last_state = save_balls_state(self.balls)
             self.hit_count += 1
             if self.hit_count >= self.MAX_HIT_COUNT:
-                print(f"⏰ 达到最大击球数，比赛结束！")
+                self._log(f"⏰ 达到最大击球数，比赛结束！")
                 self.done = True
                 a_left = len([bid for bid in self.player_targets["A"] if bid != '8' and self.balls[bid].state.s != 4])
                 b_left = len([bid for bid in self.player_targets["B"] if bid != '8' and self.balls[bid].state.s != 4])
@@ -433,15 +442,15 @@ class PoolEnv():
                     self.winner = "B"
                 else:
                     self.winner = "SAME"
-                print(f"📊 最大击球数详情：A剩余 {a_left}，B剩余 {b_left}，胜者：{self.winner}")
+                self._log(f"📊 最大击球数详情：A剩余 {a_left}，B剩余 {b_left}，胜者：{self.winner}")
             return {'ME_INTO_POCKET': own_pocketed, 'ENEMY_INTO_POCKET': enemy_pocketed, 'WHITE_BALL_INTO_POCKET': False, 'BLACK_BALL_INTO_POCKET': False, 'FOUL_FIRST_HIT': False, 'NO_POCKET_NO_RAIL': True, 'BALLS': copy.deepcopy(self.balls)}
 
         
         # 判断是否打进自己球，确定下一个击球方
         if own_pocketed:
-            print(f"🎯 Player {player} 打进了 {own_pocketed}，继续出杆。")
+            self._log(f"🎯 Player {player} 打进了 {own_pocketed}，继续出杆。")
         else:
-            print(f"❌ Player {player} 未打进自己球，交换球权。")
+            self._log(f"❌ Player {player} 未打进自己球，交换球权。")
             self.curr_player = 1 - self.curr_player
 
         # 5. 保存当前状态
@@ -450,7 +459,7 @@ class PoolEnv():
         # 更新 count数，并且判断数是否过长
         self.hit_count += 1
         if self.hit_count >= self.MAX_HIT_COUNT:
-            print(f"⏰ 达到最大击球数，比赛结束！")
+            self._log(f"⏰ 达到最大击球数，比赛结束！")
             self.done = True
             a_left = len([bid for bid in self.player_targets["A"] if bid != '8' and self.balls[bid].state.s != 4])
             b_left = len([bid for bid in self.player_targets["B"] if bid != '8' and self.balls[bid].state.s != 4])
@@ -460,7 +469,7 @@ class PoolEnv():
                 self.winner = "B"
             else:
                 self.winner = "SAME"
-            print(f"📊 最大击球数详情：A剩余 {a_left}，B剩余 {b_left}，胜者：{self.winner}")
+            self._log(f"📊 最大击球数详情：A剩余 {a_left}，B剩余 {b_left}，胜者：{self.winner}")
             return {'ME_INTO_POCKET': own_pocketed, 'ENEMY_INTO_POCKET': enemy_pocketed, 'WHITE_BALL_INTO_POCKET': False, 'BLACK_BALL_INTO_POCKET': False, 'BALLS': copy.deepcopy(self.balls)}
         
         # return 一些这一杆的结果信息

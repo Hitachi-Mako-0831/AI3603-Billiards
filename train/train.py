@@ -6,7 +6,7 @@ import random
 import sys
 import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 import numpy as np
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -17,6 +17,35 @@ for path in (SCRIPT_DIR, ROOT_DIR):
 
 from poolenv import PoolEnv  
 from sac import SACAgent, SACConfig  
+
+SAFE_ACTION_LIMITS: Dict[str, Tuple[float, float]] = {
+	"V0": (0.5, 6.0),
+	"phi": (0.0, 360.0),
+	"theta": (0.0, 80.0),
+	"a": (-0.3, 0.3),
+	"b": (-0.3, 0.3),
+}
+
+
+def enforce_action_bounds(action: Dict[str, float]) -> Tuple[Dict[str, float], bool]:
+	"""Clip action dict to conservative bounds to avoid unstable physics."""
+	clipped: Dict[str, float] = {}
+	changed = False
+	for key, (low, high) in SAFE_ACTION_LIMITS.items():
+		value = float(action.get(key, low))
+		clamped = float(np.clip(value, low, high))
+		if abs(clamped - value) > 1e-6:
+			changed = True
+		clipped[key] = clamped
+	return clipped, changed
+
+
+def values_are_finite(name: str, value) -> bool:
+	arr = np.asarray(value, dtype=np.float32)
+	if np.all(np.isfinite(arr)):
+		return True
+	print(f"[Safety] {name} contains non-finite values: {arr}")
+	return False
 
 
 def parse_args() -> argparse.Namespace:
@@ -155,13 +184,14 @@ def main():
 
 		episode_reward = 0.0
 		agent_turns = 0
+		aborted_episode = False
 		done, _ = env.get_done()
 
 		if env.get_curr_player() != args.control_player:
 			penalty, done = rollout_opponent_turns(env, opponent_agent, args.control_player)
 			episode_reward += penalty
 
-		while not done:
+		while not done and not aborted_episode:
 			if env.get_curr_player() != args.control_player:
 				penalty, done = rollout_opponent_turns(env, opponent_agent, args.control_player)
 				episode_reward += penalty
@@ -170,10 +200,22 @@ def main():
 
 			balls, my_targets, table = env.get_observation(args.control_player)
 			state = sac_agent.encode_observation(balls, my_targets, table)
+			if not values_are_finite("state", state):
+				aborted_episode = True
+				break
 			action_dict, _ = sac_agent._act(state, evaluate=False)
+			action_dict, clipped = enforce_action_bounds(action_dict)
+			if clipped:
+				print(f"[Safety] Clipped action to safe bounds at episode {episode}, turn {agent_turns + 1}.")
+			if not values_are_finite("action", list(action_dict.values())):
+				aborted_episode = True
+				break
 
 			step_info = env.take_shot(action_dict)
 			immediate_reward = SACAgent.compute_dense_reward(step_info, my_targets)
+			if not values_are_finite("reward", immediate_reward):
+				aborted_episode = True
+				break
 			total_env_steps += 1
 
 			done, _ = env.get_done()
@@ -182,6 +224,9 @@ def main():
 				opponent_penalty, done = rollout_opponent_turns(env, opponent_agent, args.control_player)
 
 			total_reward = immediate_reward + opponent_penalty
+			if not values_are_finite("total_reward", total_reward):
+				aborted_episode = True
+				break
 			episode_reward += total_reward
 
 			if done:
@@ -189,6 +234,9 @@ def main():
 			else:
 				next_balls, next_targets, next_table = env.get_observation(args.control_player)
 				next_state = sac_agent.encode_observation(next_balls, next_targets, next_table)
+				if not values_are_finite("next_state", next_state):
+					aborted_episode = True
+					break
 
 			sac_agent.store_transition(state, action_dict, total_reward, next_state, done)
 
@@ -199,6 +247,9 @@ def main():
 						total_updates += 1
 
 			agent_turns += 1
+
+		if aborted_episode:
+			print(f"[Safety] Episode {episode} aborted due to invalid physics state; skipping remaining shots.")
 
 		if episode % args.save_every == 0:
 			checkpoint_path = format_checkpoint_variant(checkpoint_base, f"ep{episode}")
