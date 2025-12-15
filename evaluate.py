@@ -36,7 +36,7 @@ from sac import SACAgent  # type: ignore
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate trained SAC agent against baseline")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/sac_agent_ep1500.pth", help="路径：待评估 SAC 模型 checkpoint")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/sac_agent_ep800.pth", help="路径：待评估 SAC 模型 checkpoint")
     parser.add_argument("--games", type=int, default=40, help="评估局数")
     return parser.parse_args()
 

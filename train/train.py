@@ -5,6 +5,7 @@ import csv
 import random
 import sys
 import time
+import concurrent.futures
 from pathlib import Path
 from typing import Dict, List, Tuple
 import numpy as np
@@ -17,6 +18,7 @@ for path in (SCRIPT_DIR, ROOT_DIR):
 
 from poolenv import PoolEnv  
 from sac import SACAgent, SACConfig  
+from agent import BasicAgent
 
 SAFE_ACTION_LIMITS: Dict[str, Tuple[float, float]] = {
 	"V0": (0.5, 6.0),
@@ -50,6 +52,7 @@ def values_are_finite(name: str, value) -> bool:
 def parse_args() -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description="Soft Actor-Critic training for AI3603 billiards")
 	parser.add_argument("--episodes", type=int, default=20, help="the number of episode")
+	parser.add_argument("--opponent", type=str, choices=["base", "sac"], default="base", help="the opponent player type")
 	parser.add_argument("--control-player", type=str, choices=["A", "B"], default="A", help="the player controled by SAC agent")
 	parser.add_argument("--target-cycle", type=str, default="solid,stripe", help="recyclable ball type, split by comma")
 	parser.add_argument("--checkpoint", type=str, default="checkpoints/sac_agent.pth", help="checkpoint path")
@@ -71,6 +74,7 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--alpha", type=float, default=0.2, help="solid alpha (when forbidden auto entroy adjust)")
 	parser.add_argument("--disable-auto-entropy", action="store_true", help="diable automatic entropy adjustment")
 	parser.add_argument("--policy-update-freq", type=int, default=5, help="frequency of actor/alpha updates vs critic updates")
+	parser.add_argument("--shot-timeout-sec", type=float, default=20.0, help="abort current episode if a single take_shot exceeds this wallclock time")
 	return parser.parse_args()
 
 
@@ -87,15 +91,24 @@ def set_global_seed(seed: int) -> None:
 
 
 
-def rollout_opponent_turns(env: PoolEnv, opponent_agent: SACAgent, control_player: str) -> Tuple[float, bool]:
+def opponent_action(opponent_agent, balls, my_targets, table):
+	"""为对手选择动作，支持 SAC 自博弈或基础启发式 Agent。"""
+	if isinstance(opponent_agent, SACAgent):
+		state = opponent_agent.encode_observation(balls, my_targets, table)
+		action_dict, _ = opponent_agent._act(state, evaluate=True)
+	else:
+		action_dict = opponent_agent.decision(balls=balls, my_targets=my_targets, table=table)
+	return action_dict
+
+
+def rollout_opponent_turns(env: PoolEnv, opponent_agent, control_player: str) -> Tuple[float, bool]:
 	"""让对手智能体连续出杆直到轮到训练智能体或对局结束"""
 	cumulative_penalty = 0.0
 	done, _ = env.get_done()
 	while not done and env.get_curr_player() != control_player:
 		player = env.get_curr_player()
-		balls, my_targets, table = env.get_observation(player)
-		state = opponent_agent.encode_observation(balls, my_targets, table)
-		action_dict, _ = opponent_agent._act(state, evaluate=True)
+		balls, my_targets, table = env.get_observation(player, copy_state=False)
+		action_dict = opponent_action(opponent_agent, balls, my_targets, table)
 		step_info = env.take_shot(action_dict)
 		cumulative_penalty -= SACAgent.compute_dense_reward(step_info, my_targets)
 		done, _ = env.get_done()
@@ -165,23 +178,29 @@ def main():
 		checkpoint_path=str(checkpoint_base),
 		training=True,
 	)
-	opponent_checkpoint = format_checkpoint_variant(checkpoint_base, "opponent")
-	opponent_agent = SACAgent(
-		config=sac_config,
-		checkpoint_path=str(opponent_checkpoint),
-		training=False,
-	)
-	sync_opponent_agent(sac_agent, opponent_agent)
+ 
+	if args.opponent == "base":
+		opponent_agent = BasicAgent() 
+	elif args.opponent == "sac":
+		opponent_agent = SACAgent(
+			config=sac_config,
+			checkpoint_path=str(format_checkpoint_variant(checkpoint_base, "opponent")),
+			training=False,
+		)
+		sync_opponent_agent(sac_agent, opponent_agent)
+  
+	opponent_agent.enable_noise = args.env_noise
 	log_path = Path(args.log_dir) / "training_metrics.csv"
 
 	total_env_steps = 0
 	total_updates = 0
 	start_time = time.time()
 
-	for episode in range(1, args.episodes + 1):
-		target_ball = target_cycle[(episode - 1) % len(target_cycle)]
-		env.reset(target_ball=target_ball)
-		env.enable_noise = args.env_noise
+	with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+		for episode in range(1, args.episodes + 1):
+			target_ball = target_cycle[(episode - 1) % len(target_cycle)]
+			env.reset(target_ball=target_ball)
+			env.enable_noise = args.env_noise
 
 		episode_reward = 0.0
 		agent_turns = 0
@@ -199,7 +218,7 @@ def main():
 				if done:
 					break
 
-			balls, my_targets, table = env.get_observation(args.control_player)
+			balls, my_targets, table = env.get_observation(args.control_player, copy_state=False)
 			state = sac_agent.encode_observation(balls, my_targets, table)
 			if not values_are_finite("state", state):
 				aborted_episode = True
@@ -210,7 +229,13 @@ def main():
 				aborted_episode = True
 				break
 
-			step_info = env.take_shot(action_dict)
+			future = executor.submit(env.take_shot, action_dict)
+			try:
+				step_info = future.result(timeout=args.shot_timeout_sec)
+			except concurrent.futures.TimeoutError:
+				print(f"[Watchdog] Episode {episode} turn {agent_turns + 1} exceeded {args.shot_timeout_sec:.1f}s; aborting episode.")
+				aborted_episode = True
+				break
 			immediate_reward = SACAgent.compute_dense_reward(step_info, my_targets)
 			if not values_are_finite("reward", immediate_reward):
 				aborted_episode = True
@@ -231,7 +256,7 @@ def main():
 			if done:
 				next_state = state  # 保持当前状态，(1-dones)会清零Q值贡献
 			else:
-				next_balls, next_targets, next_table = env.get_observation(args.control_player)
+				next_balls, next_targets, next_table = env.get_observation(args.control_player, copy_state=False)
 				next_state = sac_agent.encode_observation(next_balls, next_targets, next_table)
 				if not values_are_finite("next_state", next_state):
 					aborted_episode = True
@@ -254,7 +279,7 @@ def main():
 			checkpoint_path = format_checkpoint_variant(checkpoint_base, f"ep{episode}")
 			sac_agent.save_checkpoint(checkpoint_path)
 
-		if episode % args.selfplay_sync == 0:
+		if isinstance(opponent_agent, SACAgent) and episode % args.selfplay_sync == 0:
 			sync_opponent_agent(sac_agent, opponent_agent)
 
 		elapsed = time.time() - start_time
