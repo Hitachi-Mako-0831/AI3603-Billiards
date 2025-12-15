@@ -9,6 +9,7 @@ import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.amp as amp
     
 
 BALL_ORDER: List[str] = ['cue'] + [str(i) for i in range(1, 16)]
@@ -135,8 +136,6 @@ class GaussianPolicy(nn.Module):
         return action, log_prob, mean_action
 
 
-
-
 class SACAgent():
     """基于 Soft Actor-Critic 的台球 Agent"""
 
@@ -176,6 +175,7 @@ class SACAgent():
 
         self.replay_buffer = ReplayBuffer(self.state_dim, self.action_dim, self.config.buffer_size) if self.training_enabled else None
         self.gradient_updates = 0
+        self.scaler = amp.GradScaler(enabled=(self.training_enabled and self.device.type == "cuda"))
 
         # 若存在已训练的权重则加载
         self.load_checkpoint()
@@ -194,6 +194,10 @@ class SACAgent():
         extra_features = 2     # 剩余目标比率、是否打黑8阶段
         return len(BALL_ORDER) * per_ball_features + extra_features
 
+    def encode_observation(self, balls: dict, my_targets: List[str], table: Table) -> np.ndarray:
+        """公开的观测编码接口，便于训练脚本复用"""
+        return self._encode_state(balls, my_targets, table)
+    
     def _encode_state(self, balls: dict, my_targets: List[str], table: Table) -> np.ndarray:
         features: List[float] = []
         table_l = getattr(table, 'l', 2.84) or 2.84
@@ -222,10 +226,6 @@ class SACAgent():
         features.append(remaining_targets / total_targets)
         features.append(phase_black)
         return np.asarray(features, dtype=np.float32)
-
-    def encode_observation(self, balls: dict, my_targets: List[str], table: Table) -> np.ndarray:
-        """公开的观测编码接口，便于训练脚本复用"""
-        return self._encode_state(balls, my_targets, table)
 
     def _random_action(self) -> Dict[str, float]:
         """回退策略：随机动作"""
@@ -290,47 +290,74 @@ class SACAgent():
         else:
             alpha_value = torch.tensor(self.alpha, dtype=torch.float32, device=self.device)
 
-        with torch.no_grad():
-            next_action, next_log_prob, _ = self.actor.sample(next_states)
-            q1_next = self.critic1_target(next_states, next_action)
-            q2_next = self.critic2_target(next_states, next_action)
-            min_q_next = torch.min(q1_next, q2_next) - alpha_value * next_log_prob
-            q_target = rewards + (1 - dones) * self.config.gamma * min_q_next
+        autocast_enabled = bool(self.scaler is not None and self.scaler.is_enabled())
+        max_grad_norm = 5.0
 
-        q1_pred = self.critic1(states, actions)
-        q2_pred = self.critic2(states, actions)
-        critic1_loss = F.mse_loss(q1_pred, q_target)
-        critic2_loss = F.mse_loss(q2_pred, q_target)
+        with amp.autocast(device_type="cuda", enabled=autocast_enabled):
+            with torch.no_grad():
+                next_action, next_log_prob, _ = self.actor.sample(next_states)
+                q1_next = self.critic1_target(next_states, next_action)
+                q2_next = self.critic2_target(next_states, next_action)
+                min_q_next = torch.min(q1_next, q2_next) - alpha_value * next_log_prob
+                q_target = rewards + (1 - dones) * self.config.gamma * min_q_next
 
+            q1_pred = self.critic1(states, actions)
+            q2_pred = self.critic2(states, actions)
+            critic1_loss = F.mse_loss(q1_pred, q_target)
+            critic2_loss = F.mse_loss(q2_pred, q_target)
+
+        # Critics
         self.critic1_optimizer.zero_grad()
-        critic1_loss.backward()
-        self.critic1_optimizer.step()
-
         self.critic2_optimizer.zero_grad()
-        critic2_loss.backward()
-        self.critic2_optimizer.step()
+        if autocast_enabled:
+            self.scaler.scale(critic1_loss).backward()
+            self.scaler.scale(critic2_loss).backward()
+            self.scaler.unscale_(self.critic1_optimizer)
+            self.scaler.unscale_(self.critic2_optimizer)
+            torch.nn.utils.clip_grad_norm_(list(self.critic1.parameters()) + list(self.critic2.parameters()), max_grad_norm)
+            self.scaler.step(self.critic1_optimizer)
+            self.scaler.step(self.critic2_optimizer)
+        else:
+            critic1_loss.backward()
+            critic2_loss.backward()
+            torch.nn.utils.clip_grad_norm_(list(self.critic1.parameters()) + list(self.critic2.parameters()), max_grad_norm)
+            self.critic1_optimizer.step()
+            self.critic2_optimizer.step()
 
         self.gradient_updates += 1
 
         actor_loss = None
         alpha_loss = None
         if self.gradient_updates % self.config.policy_update_freq == 0:
-            new_actions, log_pi, _ = self.actor.sample(states)
-            q1_new = self.critic1(states, new_actions)
-            q2_new = self.critic2(states, new_actions)
-            min_q_new = torch.min(q1_new, q2_new)
-            actor_loss = (alpha_value * log_pi - min_q_new).mean()
+            with amp.autocast(device_type="cuda", enabled=autocast_enabled):
+                new_actions, log_pi, _ = self.actor.sample(states)
+                q1_new = self.critic1(states, new_actions)
+                q2_new = self.critic2(states, new_actions)
+                min_q_new = torch.min(q1_new, q2_new)
+                actor_loss = (alpha_value * log_pi - min_q_new).mean()
 
             self.actor_optimizer.zero_grad()
-            actor_loss.backward()
-            self.actor_optimizer.step()
+            if autocast_enabled:
+                self.scaler.scale(actor_loss).backward()
+                self.scaler.unscale_(self.actor_optimizer)
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_grad_norm)
+                self.scaler.step(self.actor_optimizer)
+            else:
+                actor_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_grad_norm)
+                self.actor_optimizer.step()
 
             if self.automatic_entropy_tuning:
                 alpha_loss = -(self.log_alpha * (log_pi + self.target_entropy).detach()).mean()
                 self.alpha_optim.zero_grad()
+                # alpha 更新不走 scaler，避免“no inf checks recorded”断言
                 alpha_loss.backward()
+                torch.nn.utils.clip_grad_norm_([self.log_alpha], max_grad_norm)
                 self.alpha_optim.step()
                 self.alpha = self.log_alpha.exp()
+
+        if autocast_enabled:
+            self.scaler.update()
 
         self._soft_update(self.critic1, self.critic1_target)
         self._soft_update(self.critic2, self.critic2_target)
