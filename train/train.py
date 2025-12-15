@@ -5,9 +5,8 @@ import csv
 import random
 import sys
 import time
-import concurrent.futures
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, Tuple
 import numpy as np
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -51,13 +50,13 @@ def values_are_finite(name: str, value) -> bool:
 
 def parse_args() -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description="Soft Actor-Critic training for AI3603 billiards")
-	parser.add_argument("--episodes", type=int, default=20, help="the number of episode")
+	parser.add_argument("--episodes", type=int, default=200, help="the number of episode")
 	parser.add_argument("--opponent", type=str, choices=["base", "sac"], default="base", help="the opponent player type")
 	parser.add_argument("--control-player", type=str, choices=["A", "B"], default="A", help="the player controled by SAC agent")
 	parser.add_argument("--target-cycle", type=str, default="solid,stripe", help="recyclable ball type, split by comma")
 	parser.add_argument("--checkpoint", type=str, default="checkpoints/sac_agent.pth", help="checkpoint path")
 	parser.add_argument("--log-dir", type=str, default="logs", help="log path")
-	parser.add_argument("--save-every", type=int, default=5, help="how many echos we save the model")
+	parser.add_argument("--save-every", type=int, default=20, help="how many echos we save the model")
 	parser.add_argument("--selfplay-sync", type=int, default=50, help="episodes between syncing opponent weights")
 	parser.add_argument("--seed", type=int, default=42, help="randon seed")
 	parser.add_argument("--env-noise", action="store_true", help="use the environment noise")
@@ -90,7 +89,6 @@ def set_global_seed(seed: int) -> None:
 		pass
 
 
-
 def opponent_action(opponent_agent, balls, my_targets, table):
 	"""为对手选择动作，支持 SAC 自博弈或基础启发式 Agent。"""
 	if isinstance(opponent_agent, SACAgent):
@@ -116,18 +114,21 @@ def rollout_opponent_turns(env: PoolEnv, opponent_agent, control_player: str) ->
 
 
 def sync_opponent_agent(source: SACAgent, target: SACAgent) -> None:
-	target.actor.load_state_dict(source.actor.state_dict())
-	target.actor.eval()
+    """同步对手的参数"""
+    target.actor.load_state_dict(source.actor.state_dict())
+    target.actor.eval()
 
 
 def format_checkpoint_variant(base_path: Path, tag: str) -> Path:
-	return base_path.with_name(f"{base_path.stem}_{tag}{base_path.suffix}")
+    """生成checkpoint文件名"""
+    return base_path.with_name(f"{base_path.stem}_{tag}{base_path.suffix}")
 
 
 def append_metrics(log_path: Path, row: dict) -> None:
-	log_path.parent.mkdir(parents=True, exist_ok=True)
-	file_exists = log_path.exists()
-	fieldnames = [
+    """添加日志信息"""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = log_path.exists()
+    fieldnames = [
 		"episode",
 		"reward",
 		"agent_turns",
@@ -136,14 +137,15 @@ def append_metrics(log_path: Path, row: dict) -> None:
 		"total_env_steps",
 		"elapsed_sec",
 	]
-	with log_path.open("a", newline="") as csvfile:
-		writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-		if not file_exists:
-			writer.writeheader()
-		writer.writerow(row)
+    with log_path.open("a", newline="") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def main():
+    # 读取参数
 	args = parse_args()
 	set_global_seed(args.seed)
 
@@ -155,10 +157,12 @@ def main():
 	if args.selfplay_sync <= 0:
 		raise ValueError("--selfplay-sync must be positive")
 
+	# 生成训练环境
 	env = PoolEnv(verbose=False, record_shots=False)
 	env.enable_noise = args.env_noise
 	checkpoint_base = Path(args.checkpoint)
 
+	# 训练Agent参数
 	sac_config = SACConfig(
 		hidden_dim=args.hidden_dim,
 		gamma=args.gamma,
@@ -178,7 +182,8 @@ def main():
 		checkpoint_path=str(checkpoint_base),
 		training=True,
 	)
- 
+	
+	# 对手Agent
 	if args.opponent == "base":
 		opponent_agent = BasicAgent() 
 	elif args.opponent == "sac":
@@ -196,63 +201,66 @@ def main():
 	total_updates = 0
 	start_time = time.time()
 
-	with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-		for episode in range(1, args.episodes + 1):
-			target_ball = target_cycle[(episode - 1) % len(target_cycle)]
-			env.reset(target_ball=target_ball)
-			env.enable_noise = args.env_noise
+	for episode in range(1, args.episodes + 1):
+		target_ball = target_cycle[(episode - 1) % len(target_cycle)]
+		env.reset(target_ball=target_ball)
+		env.enable_noise = args.env_noise
 
 		episode_reward = 0.0
 		agent_turns = 0
 		aborted_episode = False
 		done, _ = env.get_done()
 
+		# 如果对手先手，对手先行动
 		if env.get_curr_player() != args.control_player:
 			penalty, done = rollout_opponent_turns(env, opponent_agent, args.control_player)
 			episode_reward += penalty
 
+		# 游戏主循环
 		while not done and not aborted_episode:
+			# 确保轮到训练智能体
 			if env.get_curr_player() != args.control_player:
 				penalty, done = rollout_opponent_turns(env, opponent_agent, args.control_player)
 				episode_reward += penalty
 				if done:
 					break
-
+			
+			# 获取当前状态
 			balls, my_targets, table = env.get_observation(args.control_player, copy_state=False)
 			state = sac_agent.encode_observation(balls, my_targets, table)
 			if not values_are_finite("state", state):
 				aborted_episode = True
 				break
+
+			# 选择动作
 			action_dict, _ = sac_agent._act(state, evaluate=False)
 			action_dict, clipped = enforce_action_bounds(action_dict)
 			if not values_are_finite("action", list(action_dict.values())):
 				aborted_episode = True
 				break
 
-			future = executor.submit(env.take_shot, action_dict)
-			try:
-				step_info = future.result(timeout=args.shot_timeout_sec)
-			except concurrent.futures.TimeoutError:
-				print(f"[Watchdog] Episode {episode} turn {agent_turns + 1} exceeded {args.shot_timeout_sec:.1f}s; aborting episode.")
-				aborted_episode = True
-				break
+			# 执行动作
+			step_info = env.take_shot(action_dict)
 			immediate_reward = SACAgent.compute_dense_reward(step_info, my_targets)
 			if not values_are_finite("reward", immediate_reward):
 				aborted_episode = True
 				break
 			total_env_steps += 1
 
+			# 检查游戏是否结束
 			done, _ = env.get_done()
 			opponent_penalty = 0.0
 			if not done:
 				opponent_penalty, done = rollout_opponent_turns(env, opponent_agent, args.control_player)
 
+			# 计算总奖励
 			total_reward = immediate_reward + opponent_penalty
 			if not values_are_finite("total_reward", total_reward):
 				aborted_episode = True
 				break
 			episode_reward += total_reward
 
+			# 获取下一个状态
 			if done:
 				next_state = state  # 保持当前状态，(1-dones)会清零Q值贡献
 			else:
@@ -262,8 +270,10 @@ def main():
 					aborted_episode = True
 					break
 
+			# 存储转移
 			sac_agent.store_transition(state, action_dict, total_reward, next_state, done)
 
+			# 更新网络参数
 			if sac_agent.replay_buffer and len(sac_agent.replay_buffer) >= args.learning_starts:
 				for _ in range(args.updates_per_step):
 					update_info = sac_agent.update_parameters()
@@ -272,16 +282,20 @@ def main():
 
 			agent_turns += 1
 
+		# episode结束处理
 		if aborted_episode:
 			print(f"[Safety] Episode {episode} aborted due to invalid physics state; skipping remaining shots.")
 
+		# 定期保存checkpoint
 		if episode % args.save_every == 0:
 			checkpoint_path = format_checkpoint_variant(checkpoint_base, f"ep{episode}")
 			sac_agent.save_checkpoint(checkpoint_path)
 
+		# 自博弈时定期同步对手
 		if isinstance(opponent_agent, SACAgent) and episode % args.selfplay_sync == 0:
 			sync_opponent_agent(sac_agent, opponent_agent)
 
+		# 记录日志
 		elapsed = time.time() - start_time
 		buffer_size = len(sac_agent.replay_buffer) if sac_agent.replay_buffer else 0
 		append_metrics(
@@ -297,11 +311,13 @@ def main():
 			},
 		)
 
+		# 打印训练进度
 		print(
 			f"[Episode {episode}/{args.episodes}] reward={episode_reward:.1f} turns={agent_turns} "
 			f"buffer={buffer_size} updates={total_updates} target={target_ball}"
 		)
 
+	# 训练结束，保存最终模型
 	sac_agent.save_checkpoint()
 	print("Training finished. Checkpoints saved to", args.checkpoint)
 
