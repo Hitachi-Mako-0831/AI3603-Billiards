@@ -119,7 +119,7 @@ class PoolEnv():
         if self.verbose:
             print(msg)
 
-    def get_observation(self, player=None):
+    def get_observation(self, player=None, copy_state: bool = True):
         """
         功能：获取指定玩家的观测信息（深拷贝）
         
@@ -180,8 +180,10 @@ class PoolEnv():
         # 如果没给player信息，则默认给当前击球方的observation
         if player == None:
             player = self.get_curr_player()
-        # 返回当前所有球的信息，以及我方球的ID
-        return copy.deepcopy(self.balls), self.player_targets[player], copy.deepcopy(self.table)
+        if copy_state:
+            return copy.deepcopy(self.balls), self.player_targets[player], copy.deepcopy(self.table)
+        # 训练时可跳过深拷贝，直接返回引用以减少开销（调用方不要原地修改）。
+        return self.balls, self.player_targets[player], self.table
         
     def get_curr_player(self,):
         """获取当前击球方
