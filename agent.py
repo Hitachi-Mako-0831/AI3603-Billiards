@@ -16,7 +16,12 @@ import copy
 import os
 from datetime import datetime
 import random
-import signal
+try:
+    import signal
+except ImportError:
+    signal = None # Windows compatible
+
+from concurrent.futures import ThreadPoolExecutor
 # from poolagent.pool import Pool as CuetipEnv, State as CuetipState
 # from poolagent import FunctionAgent
 
@@ -45,24 +50,34 @@ def simulate_with_timeout(shot, timeout=3):
     
     说明：
         使用 signal.SIGALRM 实现超时机制（仅支持 Unix/Linux）
-        超时后自动恢复，不会导致程序卡死
+        在 Windows 上，回退到普通模拟（无超时保护）
     """
-    # 设置超时信号处理器
-    old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-    signal.alarm(timeout)  # 设置超时时间
-    
-    try:
-        pt.simulate(shot, inplace=True)
-        signal.alarm(0)  # 取消超时
-        return True
-    except SimulationTimeoutError:
-        print(f"[WARNING] 物理模拟超时（>{timeout}秒），跳过此次模拟")
-        return False
-    except Exception as e:
-        signal.alarm(0)  # 取消超时
-        raise e
-    finally:
-        signal.signal(signal.SIGALRM, old_handler)  # 恢复原处理器
+    if signal and hasattr(signal, 'SIGALRM'):
+        # Unix/Linux implementation
+        # 设置超时信号处理器
+        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(timeout)  # 设置超时时间
+        
+        try:
+            pt.simulate(shot, inplace=True)
+            signal.alarm(0)  # 取消超时
+            return True
+        except SimulationTimeoutError:
+            print(f"[WARNING] 物理模拟超时（>{timeout}秒），跳过此次模拟")
+            return False
+        except Exception as e:
+            signal.alarm(0)  # 取消超时
+            raise e
+        finally:
+            signal.signal(signal.SIGALRM, old_handler)  # 恢复原处理器
+    else:
+        # Windows fallback (no timeout protection)
+        try:
+            pt.simulate(shot, inplace=True)
+            return True
+        except Exception as e:
+            print(f"[WARNING] 物理模拟失败: {e}")
+            return False
 
 # ============================================
 
@@ -205,11 +220,13 @@ class Agent():
 class BasicAgent(Agent):
     """基于贝叶斯优化的智能 Agent"""
     
-    def __init__(self, target_balls=None):
+    def __init__(self, target_balls=None, initial_search=20, opt_search=10):
         """初始化 Agent
         
         参数：
             target_balls: 保留参数，暂未使用
+            initial_search: 贝叶斯优化初始采样次数 (默认20)
+            opt_search: 贝叶斯优化迭代次数 (默认10)
         """
         super().__init__()
         
@@ -223,8 +240,8 @@ class BasicAgent(Agent):
         }
         
         # 优化参数
-        self.INITIAL_SEARCH = 20
-        self.OPT_SEARCH = 10
+        self.INITIAL_SEARCH = initial_search
+        self.OPT_SEARCH = opt_search
         self.ALPHA = 1e-2
         
         # 模拟噪声（可调整以改变训练难度）
@@ -348,10 +365,41 @@ class BasicAgent(Agent):
             
             seed = np.random.randint(1e6)
             optimizer = self._create_optimizer(reward_fn_wrapper, seed)
-            optimizer.maximize(
-                init_points=self.INITIAL_SEARCH,
-                n_iter=self.OPT_SEARCH
-            )
+            
+            # Parallel Initial Search
+            # We manually generate random points and evaluate them in parallel
+            if self.INITIAL_SEARCH > 0:
+                print(f"    [Parallel] Evaluating {self.INITIAL_SEARCH} initial points...")
+                
+                # 1. Generate random points
+                random_points = []
+                for _ in range(self.INITIAL_SEARCH):
+                    params = {}
+                    for k, (low, high) in self.pbounds.items():
+                        params[k] = np.random.uniform(low, high)
+                    random_points.append(params)
+                    
+                # 2. Parallel Evaluation
+                # pooltool likely releases GIL in some C++ parts, so threading gives speedup
+                with ThreadPoolExecutor() as executor:
+                    futures = {executor.submit(reward_fn_wrapper, **p): p for p in random_points}
+                    
+                    for future in futures:
+                        params = futures[future]
+                        try:
+                            score = future.result()
+                            # 3. Register result to optimizer
+                            optimizer.register(params=params, target=score)
+                        except Exception as e:
+                            print(f"[Warning] Evaluation failed: {e}")
+            
+            # Run remaining optimization steps sequentially
+            # init_points is 0 because we already registered initial points
+            if self.OPT_SEARCH > 0:
+                optimizer.maximize(
+                    init_points=0,
+                    n_iter=self.OPT_SEARCH
+                )
             
             best_result = optimizer.max
             best_params = best_result['params']

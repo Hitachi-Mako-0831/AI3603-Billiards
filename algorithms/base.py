@@ -25,10 +25,10 @@ class BasePolicy:
         """
         pass
 
-    def save(self, path):
+    def save(self, path, extra_info=None):
         """保存模型"""
         pass
 
     def load(self, path):
-        """加载模型"""
-        pass
+        """加载模型，返回可能的元数据字典"""
+        return {}

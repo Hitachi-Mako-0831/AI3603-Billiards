@@ -158,27 +158,60 @@ Wrapper 的核心作用不仅仅是接口转换，更重要的是定义 **Reward
 - 目标球是否被撞击并靠近了袋口？
 - 是否解到了斯诺克？
 
-### 4.4 训练难度调整 (Training Difficulty)
+### 4.4 训练难度与速度调整 (Training Difficulty & Speed)
 
-为了辅助 Agent 学习，我们可以在训练时动态调整对手 (BasicAgent) 的噪声水平。噪声越大，对手越弱（失误越多）。
+为了辅助 Agent 学习以及加快训练速度，我们可以动态调整对手 (BasicAgent) 的能力和计算量。
 
-**使用方法**:
-在 `train_manager.py` 运行时添加参数：
+**1. 调整对手噪声 (难度控制)**
+噪声越大，对手越弱（失误越多）。
 
 - `--enable_opponent_noise`: 开启对手噪声
 - `--opponent_noise_scale <float>`: 噪声放大倍率（默认 1.0）
 
+**2. 调整对手思考速度 (速度控制)**
+默认情况下，BasicAgent 会进行 30 次物理模拟来寻找最佳击球，这非常耗时。开启快速模式可以将模拟次数降至 7 次。
+
+- `--fast_opponent`: 开启快速对手模式（搜索次数从 20+10 降为 5+2），显著提高训练速度，但对手能力会变弱。
+- `--max_timesteps <int>`: 指定训练总步数（覆盖配置文件），例如 `--max_timesteps 5000`。
+
 **示例**:
 ```bash
-# 1. 默认训练 (对手无噪声，最强)
+# 1. 默认训练 (对手最强，速度最慢)
 python train_manager.py --mode train --algo ppo
 
-# 2. 开启标准噪声 (模拟真实误差)
-python train_manager.py --mode train --algo ppo --enable_opponent_noise
+# 2. 快速训练 (对手较弱，速度快，适合调试或初期训练)
+python train_manager.py --mode train --algo ppo --fast_opponent --max_timesteps 10000
 
-# 3. 开启高噪声 (对手变得很菜，适合初期训练)
+# 3. 开启高噪声 (对手很菜)
 python train_manager.py --mode train --algo ppo --enable_opponent_noise --opponent_noise_scale 5.0
+
+### 4.5 断点续训 (Resume Training)
+
+如果训练被中断，或者想在已有模型的基础上继续训练，可以使用 `--load_model` 参数。
+
+```bash
+# 从指定的 checkpoint 继续训练
+python train_manager.py --mode train --algo ppo --load_model checkpoints/ppo_interrupted.pth
 ```
+
+### 4.6 日志与可视化 (Logging & Visualization)
+
+训练过程会自动记录到 `logs/` 目录下的 CSV 文件中（例如 `logs/ppo_training_log.csv`）。
+记录的字段包括：Episode, Step, Reward, ActorLoss, CriticLoss, TotalLoss。
+
+我们提供了一个脚本 `plot_training.py` 来快速绘制训练曲线：
+
+```bash
+# 绘制 PPO 训练日志，默认输出到 logs/ppo_training_log_plot.png
+python plot_training.py --file logs/ppo_training_log.csv
+
+# 指定输出文件和抗锯齿平滑窗口大小
+python plot_training.py --file logs/ppo_training_log.csv --output results/my_plot.png --smooth 50
+```
+
+生成的图片包含两个子图：
+1. **Reward**: 包含原始奖励（透明）和移动平均奖励（实线）。
+2. **Loss**: 包含 Actor Loss, Critic Loss 和 Total Loss 的变化曲线。
 
 ---
 

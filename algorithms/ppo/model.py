@@ -3,14 +3,20 @@ import torch.nn as nn
 import numpy as np
 
 class ActorCritic(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim=256):
+    def __init__(self, state_dim, action_dim, hidden_dim=512):
         super(ActorCritic, self).__init__()
         
-        # Shared features or separate? Let's use separate for simplicity
+        # Optimized Network Architecture:
+        # 1. Increased width (256 -> 512) for better representation
+        # 2. Increased depth (2 -> 3 hidden layers)
+        # 3. Orthogonal initialization (standard practice in PPO)
+        
         self.actor = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim), # Added extra layer
             nn.Tanh(),
             nn.Linear(hidden_dim, action_dim),
             nn.Tanh() # Output range [-1, 1] for mean
@@ -23,8 +29,27 @@ class ActorCritic(nn.Module):
             nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim), # Added extra layer
+            nn.Tanh(),
             nn.Linear(hidden_dim, 1)
         )
+        
+        # Orthogonal Initialization
+        self._init_weights()
+        
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                nn.init.constant_(m.bias, 0.0)
+        
+        # Special init for Actor output (makes initial policy close to random/zero mean)
+        # The last layer of actor determines the mean action. 
+        # Low gain (0.01) makes initial actions close to 0, promoting exploration via std
+        nn.init.orthogonal_(self.actor[-2].weight, gain=0.01)
+        
+        # Special init for Critic output
+        nn.init.orthogonal_(self.critic[-1].weight, gain=1.0)
         
     def forward(self):
         raise NotImplementedError
