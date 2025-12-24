@@ -52,6 +52,27 @@ class SACConfig:
     buffer_size: int = 100_000
     automatic_entropy_tuning: bool = True
     policy_update_freq: int = 5
+    normalize_rewards: bool = True  # 是否启用奖励归一化
+
+
+class RunningMeanStd:
+    """在线计算均值和标准差（Welford算法）"""
+    
+    def __init__(self, epsilon: float = 1e-4):
+        self.mean = 0.0
+        self.var = 1.0
+        self.count = epsilon  # 避免除零
+    
+    def update(self, x: float):
+        self.count += 1
+        delta = x - self.mean
+        self.mean += delta / self.count
+        delta2 = x - self.mean
+        self.var += (delta * delta2 - self.var) / self.count
+    
+    def normalize(self, x: float) -> float:
+        std = np.sqrt(self.var + 1e-8)
+        return (x - self.mean) / std
 
 
 class ReplayBuffer:
@@ -117,20 +138,28 @@ class GaussianPolicy(nn.Module):
         self.log_std_linear = nn.Linear(hidden_dim, num_actions)
 
     def forward(self, state):
+        # 确保输入是float32以避免精度问题
+        state = state.float()
         x = F.relu(self.linear1(state))
         x = F.relu(self.linear2(x))
         mean = self.mean_linear(x)
         log_std = self.log_std_linear(x)
         log_std = torch.clamp(log_std, min=LOG_STD_MIN, max=LOG_STD_MAX)
+        # 检查并处理NaN
+        if torch.isnan(mean).any() or torch.isnan(log_std).any():
+            mean = torch.where(torch.isnan(mean), torch.zeros_like(mean), mean)
+            log_std = torch.where(torch.isnan(log_std), torch.zeros_like(log_std), log_std)
         return mean, log_std
 
     def sample(self, state):
         mean, log_std = self.forward(state)
         std = log_std.exp()
+        # 确保std有效
+        std = torch.clamp(std, min=1e-6, max=10.0)
         normal = torch.distributions.Normal(mean, std)
         z = normal.rsample()
         action = torch.tanh(z)
-        log_prob = normal.log_prob(z) - torch.log(1 - action.pow(2) + 1e-7)
+        log_prob = normal.log_prob(z) - torch.log(1 - action.pow(2) + 1e-6)
         log_prob = log_prob.sum(dim=1, keepdim=True)
         mean_action = torch.tanh(mean)
         return action, log_prob, mean_action
@@ -176,6 +205,9 @@ class SACAgent():
         self.replay_buffer = ReplayBuffer(self.state_dim, self.action_dim, self.config.buffer_size) if self.training_enabled else None
         self.gradient_updates = 0
         self.scaler = amp.GradScaler(enabled=(self.training_enabled and self.device.type == "cuda"))
+        
+        # 奖励归一化器
+        self.reward_normalizer = RunningMeanStd() if self.training_enabled and self.config.normalize_rewards else None
 
         # 若存在已训练的权重则加载
         self.load_checkpoint()
@@ -192,7 +224,8 @@ class SACAgent():
     def _compute_state_dim(self) -> int:
         per_ball_features = 6  # x, y, vx, vy, pocketed, target-flag
         extra_features = 2     # 剩余目标比率、是否打黑8阶段
-        return len(BALL_ORDER) * per_ball_features + extra_features
+        geometry_features = 8  # 白球到最近目标球距离、目标球到袋口距离、击球角度提示等
+        return len(BALL_ORDER) * per_ball_features + extra_features + geometry_features
 
     def encode_observation(self, balls: dict, my_targets: List[str], table: Table) -> np.ndarray:
         """公开的观测编码接口，便于训练脚本复用"""
@@ -200,8 +233,23 @@ class SACAgent():
     
     def _encode_state(self, balls: dict, my_targets: List[str], table: Table) -> np.ndarray:
         features: List[float] = []
-        table_l = getattr(table, 'l', 2.84) or 2.84
-        table_w = getattr(table, 'w', 1.42) or 1.42
+        table_l = getattr(table, 'l', 1.98) or 1.98  # 修正默认值
+        table_w = getattr(table, 'w', 0.99) or 0.99  # 修正默认值
+        
+        # 袋口位置
+        pocket_positions = [
+            (-0.03, -0.03),   # lb 左下
+            (-0.07, 0.99),    # lc 左中
+            (-0.03, 2.01),    # lt 左上
+            (1.02, -0.03),    # rb 右下
+            (1.06, 0.99),     # rc 右中
+            (1.02, 2.01),     # rt 右上
+        ]
+        
+        # 白球位置
+        cue_ball = balls.get('cue')
+        cue_pos = cue_ball.state.rvw[0] if cue_ball else np.array([table_l/2, table_w/2, 0])
+        
         for bid in BALL_ORDER:
             ball = balls.get(bid)
             if ball is None:
@@ -225,6 +273,68 @@ class SACAgent():
         phase_black = 1.0 if (len(my_targets) == 1 and my_targets[0] == '8') else 0.0
         features.append(remaining_targets / total_targets)
         features.append(phase_black)
+        
+        # ========== 新增：几何引导特征 ==========
+        # 找到最近的未进袋目标球
+        min_cue_to_target = float('inf')
+        best_target_pos = None
+        
+        for tid in my_targets:
+            if tid == '8' and phase_black < 0.5:
+                continue
+            ball = balls.get(tid)
+            if ball is None or ball.state.s == 4:
+                continue
+            tpos = ball.state.rvw[0]
+            dist = np.sqrt((cue_pos[0] - tpos[0])**2 + (cue_pos[1] - tpos[1])**2)
+            if dist < min_cue_to_target:
+                min_cue_to_target = dist
+                best_target_pos = tpos
+        
+        # 特征1：白球到最近目标球的归一化距离
+        cue_to_target_norm = min(min_cue_to_target / table_l, 1.0) if min_cue_to_target < float('inf') else 1.0
+        features.append(cue_to_target_norm)
+        
+        # 找最近目标球到最近袋口的距离和位置
+        min_target_to_pocket = float('inf')
+        best_pocket_pos = None
+        
+        if best_target_pos is not None:
+            for px, py in pocket_positions:
+                dist = np.sqrt((best_target_pos[0] - px)**2 + (best_target_pos[1] - py)**2)
+                if dist < min_target_to_pocket:
+                    min_target_to_pocket = dist
+                    best_pocket_pos = (px, py)
+        
+        # 特征2：目标球到袋口距离
+        target_to_pocket_norm = min(min_target_to_pocket / table_l, 1.0) if min_target_to_pocket < float('inf') else 1.0
+        features.append(target_to_pocket_norm)
+        
+        # 特征3-4：击球角度提示
+        if best_target_pos is not None and best_pocket_pos is not None:
+            vec_cue_target = np.array([best_target_pos[0] - cue_pos[0], best_target_pos[1] - cue_pos[1]])
+            vec_target_pocket = np.array([best_pocket_pos[0] - best_target_pos[0], best_pocket_pos[1] - best_target_pos[1]])
+            norm1, norm2 = np.linalg.norm(vec_cue_target), np.linalg.norm(vec_target_pocket)
+            
+            if norm1 > 1e-6 and norm2 > 1e-6:
+                ideal_dir = -vec_target_pocket / norm2
+                cos_sim = np.dot(vec_cue_target / norm1, ideal_dir)
+                ideal_phi = np.arctan2(ideal_dir[1], ideal_dir[0]) * 180 / np.pi % 360
+                features.extend([float(cos_sim), float(ideal_phi / 360.0)])
+            else:
+                features.extend([0.0, 0.0])
+        else:
+            features.extend([0.0, 0.0])
+        
+        # 特征5-6：最佳目标球位置
+        if best_target_pos is not None:
+            features.extend([float(best_target_pos[0] / table_l), float(best_target_pos[1] / table_w)])
+        else:
+            features.extend([0.5, 0.5])
+        
+        # 特征7-8：白球位置
+        features.extend([float(cue_pos[0] / table_l), float(cue_pos[1] / table_w)])
+        
         return np.asarray(features, dtype=np.float32)
 
     def _random_action(self) -> Dict[str, float]:
@@ -270,7 +380,17 @@ class SACAgent():
         if not self.training_enabled or self.replay_buffer is None:
             return
         scaled_action = self._dict_to_scaled_action(action)
-        self.replay_buffer.add(state, scaled_action, [reward], next_state, [float(done)])
+        
+        # 奖励归一化：更新统计量并归一化
+        if self.reward_normalizer is not None:
+            self.reward_normalizer.update(reward)
+            normalized_reward = self.reward_normalizer.normalize(reward)
+            # 裁剪归一化后的奖励，避免极端值
+            normalized_reward = np.clip(normalized_reward, -10.0, 10.0)
+        else:
+            normalized_reward = reward
+        
+        self.replay_buffer.add(state, scaled_action, [normalized_reward], next_state, [float(done)])
 
     def update_parameters(self):
         if not self.training_enabled or self.replay_buffer is None:
@@ -290,8 +410,9 @@ class SACAgent():
         else:
             alpha_value = torch.tensor(self.alpha, dtype=torch.float32, device=self.device)
 
-        autocast_enabled = bool(self.scaler is not None and self.scaler.is_enabled())
-        max_grad_norm = 5.0
+        # 禁用混合精度以避免float16导致的NaN问题
+        autocast_enabled = False  # bool(self.scaler is not None and self.scaler.is_enabled())
+        max_grad_norm = 1.0  # 更严格的梯度裁剪
 
         with amp.autocast(device_type="cuda", enabled=autocast_enabled):
             with torch.no_grad():
@@ -418,57 +539,88 @@ class SACAgent():
     @staticmethod
     def compute_dense_reward(step_info: dict, my_targets: List[str]) -> float:
         """
-        计算密集奖励函数
+        计算密集奖励函数（重新设计：减少惩罚、增加正向引导）
 
-        设计理念：
-        - 鼓励进攻：进球获得正奖励，无效击球给予小惩罚
-        - 严厉惩罚犯规：白球进袋、非法击球等
-        - 强化胜负：合法黑8给予大奖励，非法黑8严重惩罚
-        - 进度激励：剩余球越少，每球价值越高
+        核心理念：
+        - 降低惩罚幅度，避免agent学到"不动最安全"
+        - 大幅奖励任何积极的行为（击中球、碰库等）
+        - 进球给予巨大奖励形成明确的学习信号
         """
         reward = 0.0
+        balls = step_info.get('BALLS', {})
 
-        # 1. 进球奖励（基础分 + 进度加成）
+        # ========== 正向奖励 ==========
+        
+        # 1. 进自己的球 
         my_pocketed = step_info.get('ME_INTO_POCKET', [])
         if my_pocketed:
-            # 计算剩余目标球数（不含黑8）
-            remaining_targets = len([t for t in my_targets if t != '8'])
-            # 基础奖励50分，随着剩余球减少，奖励增加（最后一颗最多75分）
-            progress_bonus = 1.0 + (7 - remaining_targets) * 0.05  # 1.0 到 1.35
-            reward += 50.0 * len(my_pocketed) * progress_bonus
+            remaining = len([t for t in my_targets if t != '8'])
+            bonus = 1.0 + (7 - remaining) * 0.15
+            reward += 200.0 * len(my_pocketed) * bonus  # 每进一球200+分
 
-        # 2. 对方进球惩罚（虽然不常见，但可能因犯规导致）
+        # 2. 合法打进黑8 
+        if step_info.get('BLACK_BALL_INTO_POCKET'):
+            if len(my_targets) == 1 and my_targets[0] == '8':
+                reward += 500.0
+            else:
+                reward -= 200.0  # 非法黑8惩罚（降低）
+
+        # 3. 击中球 - 基础正奖励
+        if not step_info.get('NO_HIT'):
+            reward += 5.0  # 只要打到球就给奖励
+            
+            # 3.1 击中的是自己的目标球（没有FOUL_FIRST_HIT）- 额外奖励
+            if not step_info.get('FOUL_FIRST_HIT'):
+                reward += 10.0  # 正确击中目标球
+        
+        # 4. 球靠近袋口的奖励
+        if balls and not step_info.get('NO_HIT'):
+            pocket_positions = [
+                (-0.03, -0.03),   # lb 左下
+                (-0.07, 0.99),    # lc 左中
+                (-0.03, 2.01),    # lt 左上
+                (1.02, -0.03),    # rb 右下
+                (1.06, 0.99),     # rc 右中
+                (1.02, 2.01),     # rt 右上
+            ]
+            min_dist = float('inf')
+            for tid in my_targets:
+                if tid == '8':
+                    continue
+                ball = balls.get(tid)
+                if ball is None or ball.state.s == 4:
+                    continue
+                pos = ball.state.rvw[0]
+                for px, py in pocket_positions:
+                    dist = np.sqrt((pos[0] - px)**2 + (pos[1] - py)**2)
+                    min_dist = min(min_dist, dist)
+            
+            if min_dist < float('inf'):
+                # 距离<0.3m给予显著奖励，最多+15分
+                proximity_reward = max(0, (0.3 - min_dist) * 50.0)
+                reward += proximity_reward
+
+        # ========== 惩罚 ==========
+        
+        # 5. 对方进球 - 小惩罚
         enemy_pocketed = step_info.get('ENEMY_INTO_POCKET', [])
         if enemy_pocketed:
-            reward -= 25.0 * len(enemy_pocketed)
+            reward -= 15.0 * len(enemy_pocketed)
 
-        # 3. 白球进袋（严重犯规）
+        # 6. 白球进袋 - 中等惩罚
         if step_info.get('WHITE_BALL_INTO_POCKET'):
-            reward -= 100.0
+            reward -= 30.0
 
-        # 4. 黑8球进袋（胜负关键）
-        if step_info.get('BLACK_BALL_INTO_POCKET'):
-            # 合法打进黑8（己方目标球已清空）= 胜利
-            legal = len(my_targets) == 1 and my_targets[0] == '8'
-            if legal:
-                reward += 300.0  # 大幅增加胜利奖励
-            else:
-                reward -= 300.0  # 大幅增加非法黑8惩罚
-
-        # 5. 首球犯规（未先击中目标球）
+        # 7. 首球犯规 - 小惩罚
         if step_info.get('FOUL_FIRST_HIT'):
-            reward -= 30.0
+            reward -= 8.0
 
-        # 6. 无进球且无碰库（消极击球）
+        # 8. 无碰库 - 小惩罚
         if step_info.get('NO_POCKET_NO_RAIL'):
-            reward -= 30.0
+            reward -= 5.0
 
-        # 7. 完全未击中任何球（严重失误）
+        # 9. 完全没打到球 - 中等惩罚
         if step_info.get('NO_HIT'):
-            reward -= 50.0
-
-        # 8. 合法但无进球的击球：小惩罚，鼓励进攻而非保守
-        if reward == 0.0:
-            reward = -5.0  # 从 +10 改为 -5，鼓励主动进攻
+            reward -= 15.0
 
         return float(reward)

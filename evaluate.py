@@ -36,7 +36,7 @@ from sac import SACAgent  # type: ignore
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate trained SAC agent against baseline")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/sac_agent_ep800.pth", help="路径：待评估 SAC 模型 checkpoint")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/sac_agent.pth", help="路径：待评估 SAC 模型 checkpoint")
     parser.add_argument("--games", type=int, default=40, help="评估局数")
     return parser.parse_args()
 
@@ -103,6 +103,10 @@ for i in range(n_games):
             if step_info.get('ENEMY_INTO_POCKET'):
                 print(f"对方球入袋：{step_info['ENEMY_INTO_POCKET']}")
         if done:
+            # # 观看整个过程：使用 n 下一杆, p 上一杆, Space 暂停/播放, ESC 退出
+            # viewer = pt.ShotViewer()
+            # viewer.show(env.shot_record, title=f"Game {i}: {len(env.shot_record)} shots")
+
             # 统计结果（player A/B 转换为 agent A/B） 
             if info['winner'] == 'SAME':
                 results['SAME'] += 1

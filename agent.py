@@ -9,6 +9,7 @@ agent.py - Agent 决策模块
 """
 
 import math
+import signal
 import pooltool as pt
 import numpy as np
 from pooltool.objects import PocketTableSpecs, Table, TableType
@@ -16,12 +17,52 @@ import copy
 import os
 from datetime import datetime
 import random
+import warnings
 # from poolagent.pool import Pool as CuetipEnv, State as CuetipState
 # from poolagent import FunctionAgent
 
 from bayes_opt import BayesianOptimization, SequentialDomainReductionTransformer
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern
+
+# 抑制 pooltool 内部的数值警告
+warnings.filterwarnings("ignore", message="invalid value encountered in divide")
+warnings.filterwarnings("ignore", message="divide by zero")
+
+
+class SimulationTimeout(Exception):
+    """模拟超时异常"""
+    pass
+
+
+def _simulation_timeout_handler(signum, frame):
+    raise SimulationTimeout("Simulation timed out")
+
+
+def safe_simulate(shot, timeout_sec: float = 5.0):
+    """
+    带超时保护的物理模拟函数。
+    
+    参数：
+        shot: pooltool System 对象
+        timeout_sec: 超时秒数
+    
+    返回：
+        success: 是否成功完成模拟
+    """
+    old_handler = signal.signal(signal.SIGALRM, _simulation_timeout_handler)
+    signal.setitimer(signal.ITIMER_REAL, timeout_sec)
+    
+    try:
+        pt.simulate(shot, inplace=True)
+        return True
+    except SimulationTimeout:
+        return False
+    except Exception:
+        return False
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 
 def analyze_shot_for_reward(shot: pt.System, last_state: dict, player_targets: list):
@@ -170,6 +211,7 @@ class BasicAgent(Agent):
         self.INITIAL_SEARCH = 20
         self.OPT_SEARCH = 10
         self.ALPHA = 1e-2
+        self.SIM_TIMEOUT = 3.0  # 单次模拟超时秒数
         
         # 模拟噪声（可调整以改变训练难度）
         self.noise_std = {
@@ -271,8 +313,9 @@ class BasicAgent(Agent):
                     else:
                         shot.cue.set_state(V0=V0, phi=phi, theta=theta, a=a, b=b)
                     
-                    # 关键：使用 pooltool 物理引擎 (世界A)
-                    pt.simulate(shot, inplace=True)
+                    # 关键：使用带超时保护的物理模拟
+                    if not safe_simulate(shot, timeout_sec=self.SIM_TIMEOUT):
+                        return -500  # 模拟超时或失败，给予惩罚
                 except Exception as e:
                     # 模拟失败，给予极大惩罚
                     return -500
