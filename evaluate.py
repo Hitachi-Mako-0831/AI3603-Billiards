@@ -12,65 +12,22 @@ evaluate.py - Agent 评估脚本
 3. 运行脚本查看结果
 """
 
-import argparse
-import math
-import pooltool as pt
-import numpy as np
-from pooltool.objects import PocketTableSpecs, Table, TableType
-import copy
-import os
-from datetime import datetime
-import random
-import sys
-from pathlib import Path
-
-SCRIPT_DIR = Path(__file__).resolve().parent
-TRAIN_DIR = SCRIPT_DIR / "train"
-if str(TRAIN_DIR) not in sys.path:
-    sys.path.append(str(TRAIN_DIR))
-
+# 导入必要的模块
+from utils import set_random_seed
 from poolenv import PoolEnv
-from agent import Agent, BasicAgent, NewAgent
-from sac import SACAgent  # type: ignore
+from agents import BasicAgent, BasicAgentPro, HybridAgent
 
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate trained SAC agent against baseline")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/sac_agent.pth", help="路径：待评估 SAC 模型 checkpoint")
-    parser.add_argument("--games", type=int, default=40, help="评估局数")
-    return parser.parse_args()
-
-
-def build_trained_agent(checkpoint_path: str) -> SACAgent:
-    checkpoint_file = Path(checkpoint_path)
-    config_override = None
-    if checkpoint_file.is_file():
-        payload = None
-        try:
-            import torch
-            payload = torch.load(checkpoint_file, map_location="cpu", weights_only=False)
-            config_override = payload.get("config")
-            print(f"[Evaluate] 已找到 checkpoint: {checkpoint_file}")
-        except Exception as exc:
-            print(f"[Evaluate] 读取 checkpoint 失败，继续使用默认配置：{exc}")
-        finally:
-            payload = None
-    else:
-        print(f"[Evaluate] 未找到 checkpoint: {checkpoint_file}，将以随机初始化权重评估。")
-
-    if config_override is not None:
-        return SACAgent(config=config_override, checkpoint_path=str(checkpoint_file), training=False)
-    return SACAgent(checkpoint_path=str(checkpoint_file), training=False)
-
-
-args = parse_args()
+# 设置随机种子，enable=True 时使用固定种子，enable=False 时使用完全随机
+# 根据需求，我们在这里统一设置随机种子，确保 agent 双方的全局击球扰动使用相同的随机状态
+set_random_seed(enable=False, seed=42)
 
 env = PoolEnv()
 results = {'AGENT_A_WIN': 0, 'AGENT_B_WIN': 0, 'SAME': 0}
-n_games = 40
+n_games = 120  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
 
-agent_a = BasicAgent()
-agent_b = build_trained_agent(args.checkpoint)
+## 选择对打的对手
+agent_a, agent_b = BasicAgent(), HybridAgent() # 与 BasicAgent 对打
+# agent_a, agent_b = BasicAgentPro(), HybridAgent() # 与 BasicAgentPro 对打
 
 players = [agent_a, agent_b]  # 用于切换先后手
 target_ball_choice = ['solid', 'solid', 'stripe', 'stripe']  # 轮换球型
@@ -79,7 +36,9 @@ for i in range(n_games):
     print()
     print(f"------- 第 {i} 局比赛开始 -------")
     env.reset(target_ball=target_ball_choice[i % 4])
-    print(f"本局 Player A: {players[i % 2].__class__.__name__}, 目标球型: {target_ball_choice[i % 4]}")
+    player_class = players[i % 2].__class__.__name__
+    ball_type = target_ball_choice[i % 4]
+    print(f"本局 Player A: {player_class}, 目标球型: {ball_type}")
     while True:
         player = env.get_curr_player()
         print(f"[第{env.hit_count}次击球] player: {player}")
@@ -92,21 +51,18 @@ for i in range(n_games):
         
         done, info = env.get_done()
         if not done:
-            if step_info.get('FOUL_FIRST_HIT'):
-                print("本杆判罚：首次接触对方球或黑8，直接交换球权。")
-            if step_info.get('NO_POCKET_NO_RAIL'):
-                print("本杆判罚：无进球且母球或目标球未碰库，直接交换球权。")
-            if step_info.get('NO_HIT'):
-                print("本杆判罚：白球未接触任何球，直接交换球权。")
-            if step_info.get('ME_INTO_POCKET'):
-                print(f"我方球入袋：{step_info['ME_INTO_POCKET']}")
+            # poolenv中已有打印，无需再输出
+            # if step_info.get('FOUL_FIRST_HIT'):
+            #     print("本杆判罚：首次接触对方球或黑8，直接交换球权。")
+            # if step_info.get('NO_POCKET_NO_RAIL'):
+            #     print("本杆判罚：无进球且母球或目标球未碰库，直接交换球权。")
+            # if step_info.get('NO_HIT'):
+            #     print("本杆判罚：白球未接触任何球，直接交换球权。")
+            # if step_info.get('ME_INTO_POCKET'):
+            #     print(f"我方球入袋：{step_info['ME_INTO_POCKET']}")
             if step_info.get('ENEMY_INTO_POCKET'):
                 print(f"对方球入袋：{step_info['ENEMY_INTO_POCKET']}")
         if done:
-            # # 观看整个过程：使用 n 下一杆, p 上一杆, Space 暂停/播放, ESC 退出
-            # viewer = pt.ShotViewer()
-            # viewer.show(env.shot_record, title=f"Game {i}: {len(env.shot_record)} shots")
-
             # 统计结果（player A/B 转换为 agent A/B） 
             if info['winner'] == 'SAME':
                 results['SAME'] += 1
