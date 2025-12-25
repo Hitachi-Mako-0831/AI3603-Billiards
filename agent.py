@@ -29,6 +29,12 @@ from sklearn.gaussian_process.kernels import Matern
 warnings.filterwarnings("ignore", message="invalid value encountered in divide")
 warnings.filterwarnings("ignore", message="divide by zero")
 
+# Windows 不支持 SIGALRM，需降级处理
+# 使用更安全的检测方式
+import sys
+_SIGALRM_AVAILABLE = (sys.platform != 'win32') and hasattr(signal, "SIGALRM")
+_TIMEOUT_WARN_EMITTED = False
+
 
 class SimulationTimeout(Exception):
     """模拟超时异常"""
@@ -50,6 +56,20 @@ def safe_simulate(shot, timeout_sec: float = 5.0):
     返回：
         success: 是否成功完成模拟
     """
+    global _TIMEOUT_WARN_EMITTED
+
+    # Windows 或不支持 SIGALRM 时，直接运行（无超时），并只提示一次
+    if not _SIGALRM_AVAILABLE:
+        if not _TIMEOUT_WARN_EMITTED:
+            print("[safe_simulate] 当前平台不支持 SIGALRM，超时保护已禁用。")
+            _TIMEOUT_WARN_EMITTED = True
+        try:
+            pt.simulate(shot, inplace=True)
+            return True
+        except Exception:
+            return False
+
+    # POSIX 路径：使用 SIGALRM 超时保护
     old_handler = signal.signal(signal.SIGALRM, _simulation_timeout_handler)
     signal.setitimer(signal.ITIMER_REAL, timeout_sec)
     
@@ -366,11 +386,11 @@ class BasicAgent(Agent):
             return self._random_action()
 
 class HybridAgent(Agent):
-    """混合架构Agent：规则生成候选 + 快速仿真 + 学习型评估"""
-    
+    """混合架构Agent：规则生成候选 + 快速仿真 + 走位评估"""
+
     def __init__(self, use_value_network=False, value_net_path=None):
         """初始化混合Agent
-        
+
         参数：
             use_value_network: 是否使用学习型局面评估器
             value_net_path: 预训练评估网络路径
@@ -378,49 +398,59 @@ class HybridAgent(Agent):
         super().__init__()
         self.use_value_network = use_value_network
         self.value_net = None
-        
+
         if use_value_network and value_net_path:
             self._load_value_network(value_net_path)
-        
-        # 袋口位置（标准8球台）
-        self.pocket_positions = [
-            (0.0, 0.0),      # 左下
-            (1.12, 0.0),     # 中下
-            (2.24, 0.0),     # 右下
-            (0.0, 1.12),     # 左上
-            (1.12, 1.12),    # 中上
-            (2.24, 1.12),    # 右上
-        ]
-        
+
+        # 袋口位置（在决策时从 table 动态获取）
+        self.pocket_positions = None
+
+        # 球半径（标准美式球）
+        self.ball_radius = 0.028575
+
+        # 评估用噪声（与环境噪声保持一致，提升鲁棒性）
+        self.eval_noise_std = {
+            'V0': 0.1,
+            'phi': 0.1,
+            'theta': 0.1,
+            'a': 0.003,
+            'b': 0.003
+        }
+
+        # 配置参数
+        self.max_candidates_to_eval = 40  # 增加评估数量
+        self.position_weight = 0.3  # 走位评分权重
+
         print(f"[HybridAgent] 初始化完成 (评估器: {'学习型' if use_value_network else '启发式'})")
     
     def _load_value_network(self, path):
-        """加载预训练的局面评估网络（可选）"""
+        """加载预训练的局面评估网络"""
         try:
             import torch
-            import torch.nn as nn
-            
-            class ValueNetwork(nn.Module):
-                def __init__(self, input_dim=128):
-                    super().__init__()
-                    self.net = nn.Sequential(
-                        nn.Linear(input_dim, 256),
-                        nn.ReLU(),
-                        nn.Linear(256, 128),
-                        nn.ReLU(),
-                        nn.Linear(128, 1)
-                    )
-                
-                def forward(self, x):
-                    return self.net(x)
-            
-            self.value_net = ValueNetwork()
-            self.value_net.load_state_dict(torch.load(path))
+            from rl_trainer import ValueNetwork, StateEncoder
+
+            # 创建状态编码器
+            self.state_encoder = StateEncoder()
+
+            # 创建并加载网络
+            self.value_net = ValueNetwork(input_dim=self.state_encoder.feature_dim)
+
+            # 加载权重
+            checkpoint = torch.load(path, map_location='cpu')
+            if isinstance(checkpoint, dict) and 'value_net' in checkpoint:
+                self.value_net.load_state_dict(checkpoint['value_net'])
+            else:
+                self.value_net.load_state_dict(checkpoint)
+
             self.value_net.eval()
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            self.value_net.to(self.device)
+
             print(f"[HybridAgent] 成功加载评估网络: {path}")
         except Exception as e:
             print(f"[HybridAgent] 加载评估网络失败: {e}, 将使用启发式评估")
             self.value_net = None
+            self.state_encoder = None
     
     def _extract_state_features(self, balls, my_targets):
         """模块1: 状态解析 - 提取桌面特征"""
@@ -464,43 +494,158 @@ class HybridAgent(Agent):
                     'id': bid,
                     'pos': ball.state.rvw[0][:2]
                 })
-        
+
+        # 所有障碍球（包括对手球和8号球，用于阻挡检测）
+        features['all_obstacle_balls'] = []
+        for bid, ball in balls.items():
+            if bid != 'cue' and ball.state.s != 4:
+                features['all_obstacle_balls'].append({
+                    'id': bid,
+                    'pos': ball.state.rvw[0][:2]
+                })
+
         return features
+
+    def _is_path_blocked(self, start_pos, end_pos, obstacles, exclude_ball_id=None):
+        """检测路径是否被阻挡
+
+        参数：
+            start_pos: 起点位置 (x, y)
+            end_pos: 终点位置 (x, y)
+            obstacles: 障碍球列表 [{'id': str, 'pos': (x, y)}, ...]
+            exclude_ball_id: 要排除的球ID（如目标球本身）
+
+        返回：
+            bool: True 表示被阻挡
+        """
+        start = np.array(start_pos)
+        end = np.array(end_pos)
+        path_vec = end - start
+        path_len = np.linalg.norm(path_vec)
+
+        if path_len < 0.01:
+            return False
+
+        path_dir = path_vec / path_len
+
+        for obs in obstacles:
+            if exclude_ball_id and obs['id'] == exclude_ball_id:
+                continue
+
+            obs_pos = np.array(obs['pos'])
+
+            # 计算障碍球到路径的距离
+            start_to_obs = obs_pos - start
+
+            # 投影到路径方向上的距离
+            proj_len = np.dot(start_to_obs, path_dir)
+
+            # 如果投影不在路径范围内，跳过
+            if proj_len < self.ball_radius or proj_len > path_len - self.ball_radius:
+                continue
+
+            # 垂直距离
+            perp_dist = np.linalg.norm(start_to_obs - proj_len * path_dir)
+
+            # 如果垂直距离小于两个球半径，认为被阻挡
+            if perp_dist < 2.2 * self.ball_radius:
+                return True
+
+        return False
+
+    def _calculate_cut_angle(self, cue_pos, target_pos, pocket_pos):
+        """计算切球角度
+
+        返回：
+            float: 切球角度（度），0度为直球
+        """
+        cue_to_target = np.array(target_pos) - np.array(cue_pos)
+        target_to_pocket = np.array(pocket_pos) - np.array(target_pos)
+
+        len1 = np.linalg.norm(cue_to_target)
+        len2 = np.linalg.norm(target_to_pocket)
+
+        if len1 < 0.01 or len2 < 0.01:
+            return 90.0
+
+        cos_angle = np.dot(cue_to_target, target_to_pocket) / (len1 * len2)
+        cos_angle = np.clip(cos_angle, -1, 1)
+
+        # 返回切球角度（与直球的偏差）
+        angle = np.degrees(np.arccos(cos_angle))
+        return 180 - angle  # 转换为切球角度
     
     def _generate_attack_candidates(self, features, balls, table):
-        """模块2: 候选击球生成 - 进攻球（优化版）"""
+        """模块2: 候选击球生成 - 进攻球（增强版）
+
+        改进点：
+        1. 阻挡检测：过滤被挡住的路线
+        2. 更多角度和力度组合
+        3. 加入旋转参数（走位控制）
+        4. 按进球难度预排序
+        """
         candidates = []
         cue_pos = features['cue_pos']
-        ball_radius = 0.028575  # 标准球半径
-        
+        obstacles = features['all_obstacle_balls']
+
         for target_info in features['target_balls']:
             target_pos = target_info['pos']
             target_id = target_info['id']
-            
+
             # 对每个袋口生成候选
-            for pocket_info in target_info['all_pockets'][:4]:  # 考虑最近4个袋口
+            for pocket_info in target_info['all_pockets'][:6]:  # 考虑所有6个袋口
                 pocket = pocket_info[0]
                 dist_target_to_pocket = pocket_info[1]
-                
-                # 跳过太远的袋口
-                if dist_target_to_pocket > 1.5:
+
+                # 跳过太远的袋口（但保留中距离的）
+                if dist_target_to_pocket > 1.8:
                     continue
-                
+
+                # 检测目标球到袋口是否被阻挡
+                target_to_pocket_blocked = self._is_path_blocked(
+                    target_pos, pocket, obstacles, exclude_ball_id=target_id
+                )
+
                 # 计算目标球→袋口方向
                 pocket_arr = np.array(pocket)
                 target_to_pocket = pocket_arr - target_pos
                 dist = np.linalg.norm(target_to_pocket)
-                
+
                 if dist < 0.01:
                     continue
-                
+
                 target_to_pocket_norm = target_to_pocket / dist
-                
-                # 生成多个角度的候选（直球、薄球）
-                # 0度=直球(full hit), ±15度=薄球(cut shot)
-                for angle_offset in [0, -15, 15, -30, 30]:
+
+                # 计算理想击球角度（无角度偏移时）
+                ideal_hit_point = target_pos - target_to_pocket_norm * (2 * self.ball_radius)
+                cue_to_ideal = ideal_hit_point - cue_pos
+                dist_cue_to_target = np.linalg.norm(cue_to_ideal)
+
+                # 检测白球到目标球是否被阻挡
+                cue_to_target_blocked = self._is_path_blocked(
+                    cue_pos, target_pos, obstacles, exclude_ball_id=target_id
+                )
+
+                # 计算切球角度
+                cut_angle = self._calculate_cut_angle(cue_pos, target_pos, pocket)
+
+                # 如果切球角度太大（>70度），跳过
+                if cut_angle > 70:
+                    continue
+
+                # 根据阻挡情况调整难度
+                base_difficulty = dist_cue_to_target * 0.4 + dist_target_to_pocket * 0.3 + cut_angle * 0.02
+                if target_to_pocket_blocked:
+                    base_difficulty += 5.0  # 被阻挡的路线难度大增
+                if cue_to_target_blocked:
+                    base_difficulty += 3.0
+
+                # 生成多个角度的候选（更细粒度）
+                angle_offsets = [0, -5, 5, -10, 10, -20, 20, -35, 35]
+
+                for angle_offset in angle_offsets:
                     offset_rad = np.radians(angle_offset)
-                    
+
                     # 旋转击球方向
                     cos_off = np.cos(offset_rad)
                     sin_off = np.sin(offset_rad)
@@ -508,116 +653,210 @@ class HybridAgent(Agent):
                         target_to_pocket_norm[0] * cos_off - target_to_pocket_norm[1] * sin_off,
                         target_to_pocket_norm[0] * sin_off + target_to_pocket_norm[1] * cos_off
                     ])
-                    
+
                     # 计算理想击球点
-                    hit_point = target_pos - adjusted_dir * (2 * ball_radius)
-                    
+                    hit_point = target_pos - adjusted_dir * (2 * self.ball_radius)
+
                     # 计算白球→击球点的方向和距离
                     cue_to_hit = hit_point - cue_pos
                     dist_cue_to_hit = np.linalg.norm(cue_to_hit)
-                    
+
                     if dist_cue_to_hit < 0.01:
                         continue
-                    
+
                     # 计算击球角度
                     phi = np.degrees(np.arctan2(cue_to_hit[1], cue_to_hit[0])) % 360
-                    
-                    # 计算击球难度（距离+角度偏移）
-                    difficulty = dist_cue_to_hit * 0.5 + dist_target_to_pocket * 0.3 + abs(angle_offset) * 0.01
-                    
-                    # 根据距离和难度调整力度
+
+                    # 难度评估
+                    difficulty = base_difficulty + abs(angle_offset) * 0.02
+
+                    # 根据距离和难度调整力度（更细粒度）
                     total_dist = dist_cue_to_hit + dist_target_to_pocket
-                    if total_dist < 0.5:
-                        V0 = 1.8
-                    elif total_dist < 1.0:
-                        V0 = 2.5
-                    elif total_dist < 1.5:
-                        V0 = 3.5
+
+                    # 基础力度计算
+                    if total_dist < 0.3:
+                        base_v0 = 1.5
+                    elif total_dist < 0.6:
+                        base_v0 = 2.0
+                    elif total_dist < 0.9:
+                        base_v0 = 2.8
+                    elif total_dist < 1.2:
+                        base_v0 = 3.5
+                    elif total_dist < 1.6:
+                        base_v0 = 4.2
                     elif total_dist < 2.0:
-                        V0 = 4.5
+                        base_v0 = 5.0
                     else:
-                        V0 = 5.5
-                    
-                    # 薄球需要更大力度
-                    if abs(angle_offset) > 20:
-                        V0 *= 1.2
-                    
-                    # 限制力度范围
-                    V0 = np.clip(V0, 0.5, 8.0)
-                    
-                    # 生成候选动作
-                    candidate = {
-                        'V0': V0,
-                        'phi': phi,
-                        'theta': 0.0,  # 水平击打
-                        'a': 0.0,      # 中心击打
-                        'b': 0.0,
-                        'type': 'attack',
-                        'target_ball': target_id,
-                        'target_pocket': pocket,
-                        'angle_offset': angle_offset,
-                        'estimated_difficulty': difficulty
-                    }
-                    candidates.append(candidate)
-        
+                        base_v0 = 6.0
+
+                    # 切球需要适当调整力度
+                    if cut_angle > 30:
+                        base_v0 *= 1.15
+                    if cut_angle > 50:
+                        base_v0 *= 1.1
+
+                    # 生成多个力度变体
+                    v0_variants = [base_v0 * 0.9, base_v0, base_v0 * 1.1]
+
+                    # 生成不同旋转的候选（走位控制）
+                    spin_options = [
+                        (0.0, 0.0),    # 中杆
+                        (0.0, 0.3),    # 高杆（白球跟进）
+                        (0.0, -0.3),   # 低杆（白球回缩）
+                        (0.25, 0.0),   # 右塞
+                        (-0.25, 0.0),  # 左塞
+                    ]
+
+                    for V0 in v0_variants:
+                        V0 = np.clip(V0, 0.5, 8.0)
+
+                        for a, b in spin_options:
+                            candidate = {
+                                'V0': V0,
+                                'phi': phi,
+                                'theta': 0.0,
+                                'a': a,
+                                'b': b,
+                                'type': 'attack',
+                                'target_ball': target_id,
+                                'target_pocket': pocket,
+                                'angle_offset': angle_offset,
+                                'cut_angle': cut_angle,
+                                'blocked': target_to_pocket_blocked or cue_to_target_blocked,
+                                'estimated_difficulty': difficulty
+                            }
+                            candidates.append(candidate)
+
         return candidates
     
     def _generate_safe_candidates(self, features, balls, table):
-        """模块2: 候选击球生成 - 安全球（防守）（优化版）"""
+        """模块2: 候选击球生成 - 安全球（防守）（增强版）
+
+        改进策略：
+        1. 多个目标球选择（不只是最近的）
+        2. 更多力度和旋转组合
+        3. 考虑让白球移动到对手难打的位置
+        4. 添加贴库球候选
+        """
         candidates = []
         cue_pos = features['cue_pos']
-        
+
         if not features['target_balls']:
             return candidates
-        
-        # 选择最近的目标球
-        nearest_target = min(features['target_balls'], 
-                           key=lambda t: np.linalg.norm(t['pos'] - cue_pos))
-        
-        target_pos = nearest_target['pos']
-        cue_to_target = target_pos - cue_pos
-        dist = np.linalg.norm(cue_to_target)
-        
-        if dist > 0.01:
+
+        # 对多个目标球生成防守候选（不只是最近的）
+        targets_to_consider = sorted(
+            features['target_balls'],
+            key=lambda t: np.linalg.norm(t['pos'] - cue_pos)
+        )[:3]  # 考虑最近的3个目标球
+
+        for target_info in targets_to_consider:
+            target_pos = target_info['pos']
+            cue_to_target = target_pos - cue_pos
+            dist = np.linalg.norm(cue_to_target)
+
+            if dist < 0.01:
+                continue
+
             phi = np.degrees(np.arctan2(cue_to_target[1], cue_to_target[0])) % 360
-            
-            # 生成多种力度的安全球
-            for V0 in [0.8, 1.2, 1.5]:
-                candidate = {
-                    'V0': V0,
-                    'phi': phi,
-                    'theta': 0.0,
-                    'a': 0.0,
-                    'b': 0.0,
-                    'type': 'safe',
-                    'target_ball': nearest_target['id'],
-                    'estimated_difficulty': 0.0
-                }
-                candidates.append(candidate)
-            
-            # 添加侧旋球候选（让白球偏转）
-            for side_spin in [-0.3, 0.3]:
-                candidate = {
-                    'V0': 1.5,
-                    'phi': phi,
-                    'theta': 0.0,
-                    'a': side_spin,
-                    'b': 0.0,
-                    'type': 'safe',
-                    'target_ball': nearest_target['id'],
-                    'estimated_difficulty': 0.0
-                }
-                candidates.append(candidate)
-        
+
+            # 更多力度选择
+            v0_options = [0.6, 0.9, 1.2, 1.5, 2.0, 2.5]
+
+            # 更多旋转组合
+            spin_options = [
+                (0.0, 0.0),     # 中杆
+                (0.0, 0.3),     # 高杆
+                (0.0, -0.3),    # 低杆
+                (0.3, 0.0),     # 右塞
+                (-0.3, 0.0),    # 左塞
+                (0.3, -0.2),    # 右塞+低杆
+                (-0.3, -0.2),   # 左塞+低杆
+            ]
+
+            for V0 in v0_options:
+                for a, b in spin_options:
+                    candidate = {
+                        'V0': V0,
+                        'phi': phi,
+                        'theta': 0.0,
+                        'a': a,
+                        'b': b,
+                        'type': 'safe',
+                        'target_ball': target_info['id'],
+                        'estimated_difficulty': 0.5  # 防守难度基线
+                    }
+                    candidates.append(candidate)
+
+            # 添加角度偏移的防守候选（轻轻碰触目标球）
+            for angle_offset in [-30, -15, 15, 30]:
+                offset_phi = (phi + angle_offset) % 360
+                for V0 in [0.8, 1.2]:
+                    candidate = {
+                        'V0': V0,
+                        'phi': offset_phi,
+                        'theta': 0.0,
+                        'a': 0.0,
+                        'b': -0.2,  # 低杆防止跟球
+                        'type': 'safe',
+                        'target_ball': target_info['id'],
+                        'estimated_difficulty': 0.6
+                    }
+                    candidates.append(candidate)
+
+        # 添加贴库球候选（把白球打到边库附近）
+        # 这种球很难被对手准确击打
+        if hasattr(table, 'l') and hasattr(table, 'w'):
+            L = float(table.l)
+            W = float(table.w)
+
+            # 四个角落方向（让白球远离中心）
+            corner_targets = [
+                (0.1, 0.1),         # 左下角
+                (L - 0.1, 0.1),     # 右下角
+                (0.1, W - 0.1),     # 左上角
+                (L - 0.1, W - 0.1), # 右上角
+            ]
+
+            for corner in corner_targets:
+                corner_arr = np.array(corner)
+                cue_to_corner = corner_arr - cue_pos
+                dist_to_corner = np.linalg.norm(cue_to_corner)
+
+                if dist_to_corner < 0.1:
+                    continue
+
+                phi_corner = np.degrees(np.arctan2(cue_to_corner[1], cue_to_corner[0])) % 360
+
+                # 轻推白球到角落
+                for V0 in [1.0, 1.5, 2.0]:
+                    candidate = {
+                        'V0': V0,
+                        'phi': phi_corner,
+                        'theta': 0.0,
+                        'a': 0.0,
+                        'b': 0.0,
+                        'type': 'safe_position',
+                        'target_ball': None,
+                        'estimated_difficulty': 0.8
+                    }
+                    candidates.append(candidate)
+
         return candidates
     
     def _fast_simulate_and_score(self, candidate, balls, my_targets, table):
-        """模块3: 快速仿真 + 评分"""
+        """模块3: 快速仿真 + 走位评分（增强版）
+
+        改进：
+        1. 在基础评分上加入走位评估
+        2. 考虑击球后白球的位置质量
+        3. 对连续进攻机会给予奖励
+        """
         # 创建仿真环境
         sim_balls = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
         sim_table = copy.deepcopy(table)
         cue = pt.Cue(cue_ball_id="cue")
-        
+
         shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
         shot.cue.set_state(
             V0=candidate['V0'],
@@ -626,94 +865,320 @@ class HybridAgent(Agent):
             a=candidate['a'],
             b=candidate['b']
         )
-        
+
         # 保存初始状态
         last_state = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
-        
+
         # 执行仿真
         success = safe_simulate(shot, timeout_sec=2.0)
-        
+
         if not success:
             return -1000  # 仿真失败，极低分
-        
+
         # 使用现有的评分函数
-        reward = analyze_shot_for_reward(shot, last_state, my_targets)
-        
-        # 如果使用学习型评估器，这里可以融合神经网络评分
-        if self.use_value_network and self.value_net is not None:
-            # TODO: 实现特征向量化并通过网络评估
-            pass
-        
-        return reward
+        base_reward = analyze_shot_for_reward(shot, last_state, my_targets)
+
+        # ---------- 噪声鲁棒性评估（降低误打黑8风险） ----------
+        # 仅在当前目标不是“只剩黑8”时检查误打风险
+        risk_penalty = 0
+        targeting_only_eight = (len(my_targets) == 1 and my_targets[0] == '8')
+
+        if not targeting_only_eight and base_reward > -120:  # 排除本就犯规的候选
+            noisy_rewards = []
+            # 进行少量带噪声的快速仿真，模拟实战偏差
+            for _ in range(2):
+                noisy_shot = pt.System(table=copy.deepcopy(table), balls={bid: copy.deepcopy(ball) for bid, ball in balls.items()}, cue=pt.Cue(cue_ball_id="cue"))
+
+                # 为动作添加与环境一致的高斯噪声并裁剪
+                V0_n = np.clip(candidate['V0'] + np.random.normal(0, self.eval_noise_std['V0']), 0.5, 8.0)
+                phi_n = (candidate['phi'] + np.random.normal(0, self.eval_noise_std['phi'])) % 360
+                theta_n = np.clip(candidate['theta'] + np.random.normal(0, self.eval_noise_std['theta']), 0, 90)
+                a_n = np.clip(candidate['a'] + np.random.normal(0, self.eval_noise_std['a']), -0.5, 0.5)
+                b_n = np.clip(candidate['b'] + np.random.normal(0, self.eval_noise_std['b']), -0.5, 0.5)
+
+                noisy_shot.cue.set_state(V0=V0_n, phi=phi_n, theta=theta_n, a=a_n, b=b_n)
+
+                noisy_last_state = {bid: copy.deepcopy(ball) for bid, ball in balls.items()}
+
+                if safe_simulate(noisy_shot, timeout_sec=1.5):
+                    r = analyze_shot_for_reward(noisy_shot, noisy_last_state, my_targets)
+                else:
+                    r = -500
+                noisy_rewards.append(r)
+
+            if noisy_rewards:
+                worst = min(noisy_rewards)
+                avg = sum(noisy_rewards) / len(noisy_rewards)
+
+                # 若任何一次出现严重犯规/黑8进袋，给予显著惩罚
+                if worst <= -120:
+                    risk_penalty -= 120
+                # 若平均回报远低于无噪声表现，给予适度惩罚
+                elif avg < base_reward - 40:
+                    risk_penalty -= 40
+
+        # ========== 走位评分 ==========
+        position_score = 0
+
+        # 获取击球后白球位置
+        cue_ball = shot.balls.get('cue')
+        if cue_ball and cue_ball.state.s != 4:  # 白球没进袋
+            cue_final_pos = cue_ball.state.rvw[0][:2]
+
+            # 找出剩余的目标球
+            remaining_targets = []
+            for bid in my_targets:
+                if bid in shot.balls and shot.balls[bid].state.s != 4:
+                    remaining_targets.append({
+                        'id': bid,
+                        'pos': shot.balls[bid].state.rvw[0][:2]
+                    })
+
+            # 如果己方球全清空，下一个目标是8号球
+            if len(remaining_targets) == 0 and '8' in shot.balls and shot.balls['8'].state.s != 4:
+                remaining_targets.append({
+                    'id': '8',
+                    'pos': shot.balls['8'].state.rvw[0][:2]
+                })
+
+            if remaining_targets:
+                # 计算白球到最近目标球的距离
+                min_dist_to_target = min(
+                    np.linalg.norm(cue_final_pos - np.array(t['pos']))
+                    for t in remaining_targets
+                )
+
+                # 距离奖励：越近越好（但不要太近，避免犯规风险）
+                if min_dist_to_target < 0.1:  # 太近可能贴球
+                    position_score -= 5
+                elif min_dist_to_target < 0.3:
+                    position_score += 15
+                elif min_dist_to_target < 0.5:
+                    position_score += 10
+                elif min_dist_to_target < 0.8:
+                    position_score += 5
+                elif min_dist_to_target > 1.5:
+                    position_score -= 5
+
+                # 检查下一杆的进球可能性
+                best_next_shot_score = -100
+                for target_info in remaining_targets:
+                    target_pos = target_info['pos']
+
+                    for pocket in self.pocket_positions:
+                        pocket_arr = np.array(pocket)
+                        dist_to_pocket = np.linalg.norm(target_pos - pocket_arr)
+
+                        if dist_to_pocket > 1.5:
+                            continue
+
+                        # 计算切球角度
+                        cut_angle = self._calculate_cut_angle(cue_final_pos, target_pos, pocket)
+
+                        # 简单评估下一杆难度
+                        dist_cue_to_target = np.linalg.norm(cue_final_pos - target_pos)
+
+                        # 难度分数（越低越好）
+                        shot_difficulty = dist_cue_to_target * 0.3 + dist_to_pocket * 0.2 + cut_angle * 0.01
+
+                        # 检查路线是否被阻挡
+                        obstacles = []
+                        for bid, ball in shot.balls.items():
+                            if bid != 'cue' and bid != target_info['id'] and ball.state.s != 4:
+                                obstacles.append({'id': bid, 'pos': ball.state.rvw[0][:2]})
+
+                        if self._is_path_blocked(cue_final_pos, target_pos, obstacles):
+                            shot_difficulty += 3.0
+
+                        next_shot_score = 20 - shot_difficulty * 10
+                        best_next_shot_score = max(best_next_shot_score, next_shot_score)
+
+                if best_next_shot_score > -50:
+                    position_score += best_next_shot_score * 0.5
+
+            # 白球位置质量：避免贴库（难打）
+            if hasattr(table, 'l') and hasattr(table, 'w'):
+                L = float(table.l)
+                W = float(table.w)
+
+                # 距离边库的最小距离
+                dist_to_cushion = min(
+                    cue_final_pos[0],        # 左边
+                    L - cue_final_pos[0],    # 右边
+                    cue_final_pos[1],        # 下边
+                    W - cue_final_pos[1]     # 上边
+                )
+
+                if dist_to_cushion < 0.05:  # 太贴库
+                    position_score -= 10
+                elif dist_to_cushion < 0.1:
+                    position_score -= 5
+
+        # ========== 神经网络评分（如果可用）==========
+        nn_score = 0
+        if self.use_value_network and self.value_net is not None and self.state_encoder is not None:
+            try:
+                import torch
+                # 编码击球后的局面状态
+                state_features = self.state_encoder.encode(
+                    shot.balls, my_targets, table, self.pocket_positions
+                )
+                state_tensor = torch.FloatTensor(state_features).unsqueeze(0).to(self.device)
+
+                with torch.no_grad():
+                    # 网络输出范围 [0, 1]，表示预期胜率
+                    value = self.value_net(state_tensor).item()
+
+                # 转换为分数：胜率0.5为基准，范围映射到 [-30, +30]
+                nn_score = (value - 0.5) * 60
+
+            except Exception as e:
+                pass  # 网络评估失败时忽略
+
+        # 组合最终分数
+        final_score = base_reward + position_score * self.position_weight + nn_score * 0.5 + risk_penalty
+
+        return final_score
     
     def _filter_and_rank(self, candidates_with_scores):
         """模块5: 决策与约束过滤"""
         # 过滤掉评分很低的（可能犯规）
         valid_candidates = [c for c in candidates_with_scores if c['score'] > -50]
-        
+
         if not valid_candidates:
             return None
-        
+
         # 按得分排序
         valid_candidates.sort(key=lambda x: x['score'], reverse=True)
-        
+
         return valid_candidates[0]
-    
+
+    def _local_optimize(self, best_candidate, balls, my_targets, table):
+        """对最佳候选进行局部微调优化
+
+        在最佳候选周围搜索更优的参数组合
+        """
+        best_score = best_candidate['score']
+        best_action = best_candidate
+
+        # 微调参数范围
+        phi_deltas = [-3, -1.5, 0, 1.5, 3]
+        v0_factors = [0.95, 1.0, 1.05]
+
+        for phi_delta in phi_deltas:
+            for v0_factor in v0_factors:
+                if phi_delta == 0 and v0_factor == 1.0:
+                    continue  # 跳过原始候选
+
+                tweaked = {
+                    'V0': np.clip(best_candidate['V0'] * v0_factor, 0.5, 8.0),
+                    'phi': (best_candidate['phi'] + phi_delta) % 360,
+                    'theta': best_candidate['theta'],
+                    'a': best_candidate['a'],
+                    'b': best_candidate['b'],
+                    'type': best_candidate.get('type', 'attack')
+                }
+
+                score = self._fast_simulate_and_score(tweaked, balls, my_targets, table)
+
+                if score > best_score:
+                    best_score = score
+                    best_action = {**tweaked, 'score': score}
+
+        return best_action
+
     def decision(self, balls=None, my_targets=None, table=None):
         """主决策流程"""
         if balls is None or my_targets is None:
             print("[HybridAgent] 缺少必要信息，使用随机动作")
             return self._random_action()
-        
+
         try:
             # 检查是否需要打8号球
             remaining_own = [bid for bid in my_targets if balls[bid].state.s != 4]
             if len(remaining_own) == 0:
                 my_targets = ["8"]
                 print("[HybridAgent] 目标切换为8号球")
-            
+
+            # 根据当前桌面动态设置袋口位置
+            try:
+                if hasattr(table, 'pockets') and table.pockets:
+                    self.pocket_positions = [
+                        (float(p.center[0]), float(p.center[1])) for p in table.pockets.values()
+                    ]
+                elif hasattr(table, 'l') and hasattr(table, 'w'):
+                    L = float(table.l)
+                    W = float(table.w)
+                    self.pocket_positions = [
+                        (0.0, 0.0), (L/2.0, 0.0), (L, 0.0),
+                        (0.0, W), (L/2.0, W), (L, W),
+                    ]
+                else:
+                    self.pocket_positions = [
+                        (0.0, 0.0), (1.12, 0.0), (2.24, 0.0),
+                        (0.0, 1.12), (1.12, 1.12), (2.24, 1.12),
+                    ]
+            except Exception:
+                self.pocket_positions = [
+                    (0.0, 0.0), (1.12, 0.0), (2.24, 0.0),
+                    (0.0, 1.12), (1.12, 1.12), (2.24, 1.12),
+                ]
+
             # 模块1: 状态解析
             features = self._extract_state_features(balls, my_targets)
             if features is None or features['cue_pos'] is None:
                 return self._random_action()
-            
+
             print(f"[HybridAgent] 分析局面: {len(features['target_balls'])} 个目标球")
-            
+
             # 模块2: 生成候选
             attack_candidates = self._generate_attack_candidates(features, balls, table)
             safe_candidates = self._generate_safe_candidates(features, balls, table)
-            
+
             all_candidates = attack_candidates + safe_candidates
-            
+
             if not all_candidates:
                 print("[HybridAgent] 无法生成候选，使用随机动作")
                 return self._random_action()
-            
+
             print(f"[HybridAgent] 生成 {len(attack_candidates)} 个进攻候选, {len(safe_candidates)} 个防守候选")
-            
+
+            # 智能筛选：优先评估未被阻挡的进攻候选
+            unblocked_attacks = [c for c in attack_candidates if not c.get('blocked', False)]
+            blocked_attacks = [c for c in attack_candidates if c.get('blocked', False)]
+
+            # 按难度排序
+            unblocked_attacks.sort(key=lambda c: c.get('estimated_difficulty', 0))
+            blocked_attacks.sort(key=lambda c: c.get('estimated_difficulty', 0))
+            safe_candidates.sort(key=lambda c: c.get('estimated_difficulty', 0))
+
+            # 组合候选列表：优先未被阻挡的进攻 > 被阻挡的进攻 > 防守
+            prioritized_candidates = (
+                unblocked_attacks[:30] +
+                blocked_attacks[:10] +
+                safe_candidates[:20]
+            )
+
             # 模块3: 快速仿真与评分
-            # 优先评估看起来简单的候选（距离近、角度小）
-            all_candidates.sort(key=lambda c: c.get('estimated_difficulty', 0))
-            
             candidates_with_scores = []
-            max_candidates_to_eval = min(20, len(all_candidates))  # 最多评估20个
-            
-            for i, candidate in enumerate(all_candidates[:max_candidates_to_eval]):
+            max_eval = min(self.max_candidates_to_eval, len(prioritized_candidates))
+            print(f"[HybridAgent] 正在评估 {max_eval} 个候选")
+            for i, candidate in enumerate(prioritized_candidates[:max_eval]):
                 score = self._fast_simulate_and_score(candidate, balls, my_targets, table)
-                candidates_with_scores.append({
-                    **candidate,
-                    'score': score
-                })
-                if (i + 1) % 5 == 0:
-                    print(f"[HybridAgent] 已评估 {i+1}/{max_candidates_to_eval} 个候选")
-            
+                candidates_with_scores.append({**candidate, 'score': score})
+
             # 模块5: 过滤与决策
             best = self._filter_and_rank(candidates_with_scores)
-            
+
             if best is None:
                 print("[HybridAgent] 所有候选都不合格，使用随机动作")
                 return self._random_action()
-            
+
+            # 局部优化：对最佳候选进行微调
+            if best['score'] > 0:  # 只对有希望的候选进行优化
+                best = self._local_optimize(best, balls, my_targets, table)
+                print(f"[HybridAgent] 局部优化后得分: {best['score']:.1f}")
+
             action = {
                 'V0': float(best['V0']),
                 'phi': float(best['phi']),
@@ -721,8 +1186,8 @@ class HybridAgent(Agent):
                 'a': float(best['a']),
                 'b': float(best['b'])
             }
-            
-            print(f"[HybridAgent] 决策 ({best['type']}, 得分: {best['score']:.1f}): "
+
+            print(f"[HybridAgent] 决策 ({best.get('type', 'unknown')}, 得分: {best['score']:.1f}): "
                   f"V0={action['V0']:.2f}, phi={action['phi']:.1f}°")
             
             return action
@@ -732,21 +1197,3 @@ class HybridAgent(Agent):
             import traceback
             traceback.print_exc()
             return self._random_action()
-
-
-class NewAgent(Agent):
-    """自定义 Agent 模板（待学生实现）"""
-    
-    def __init__(self):
-        pass
-    
-    def decision(self, balls=None, my_targets=None, table=None):
-        """决策方法
-        
-        参数：
-            observation: (balls, my_targets, table)
-        
-        返回：
-            dict: {'V0', 'phi', 'theta', 'a', 'b'}
-        """
-        return self._random_action()

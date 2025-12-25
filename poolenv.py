@@ -22,7 +22,7 @@ import os
 from datetime import datetime
 import random
 
-from agent import Agent, BasicAgent, NewAgent
+from agent import Agent, BasicAgent, HybridAgent
 
 
 def collect_ball_states(shot):
