@@ -1,13 +1,3 @@
-"""
-agent.py - Agent 决策模块
-
-定义 Agent 基类和具体实现：
-- Agent: 基类，定义决策接口
-- BasicAgent: 基于贝叶斯优化的参考实现
-- NewAgent: 学生自定义实现模板
-- analyze_shot_for_reward: 击球结果评分函数
-"""
-
 import math
 import pooltool as pt
 import numpy as np
@@ -28,6 +18,9 @@ from concurrent.futures import ThreadPoolExecutor
 from bayes_opt import BayesianOptimization, SequentialDomainReductionTransformer
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern
+
+from .agent import Agent
+
 
 # ============ 超时安全模拟机制 ============
 class SimulationTimeoutError(Exception):
@@ -216,7 +209,6 @@ class Agent():
         return action
 
 
-
 class BasicAgent(Agent):
     """基于贝叶斯优化的智能 Agent"""
     
@@ -254,7 +246,7 @@ class BasicAgent(Agent):
         }
         self.enable_noise = False
         
-        print("BasicAgent (Smart, pooltool-native) 已初始化。")
+        print("BasicAgent (贝叶斯优化版) 已初始化。")
 
     
     def _create_optimizer(self, reward_function, seed):
@@ -316,7 +308,7 @@ class BasicAgent(Agent):
                 my_targets = ["8"]
                 print("[BasicAgent] 我的目标球已全部清空，自动切换目标为：8号球")
 
-            # 1.动态创建“奖励函数” (Wrapper)
+            # 1.动态创建"奖励函数" (Wrapper)
             # 贝叶斯优化器会调用此函数，并传入参数
             def reward_fn_wrapper(V0, phi, theta, a, b):
                 # 创建一个用于模拟的沙盒系统
@@ -351,7 +343,7 @@ class BasicAgent(Agent):
                     # 模拟失败，给予极大惩罚
                     return -500
                 
-                # 使用我们的“裁判”来打分
+                # 使用我们的"裁判"来打分
                 score = analyze_shot_for_reward(
                     shot=shot,
                     last_state=last_state_snapshot,
@@ -426,20 +418,3 @@ class BasicAgent(Agent):
             import traceback
             traceback.print_exc()
             return self._random_action()
-
-class NewAgent(Agent):
-    """自定义 Agent 模板（待学生实现）"""
-    
-    def __init__(self):
-        pass
-    
-    def decision(self, balls=None, my_targets=None, table=None):
-        """决策方法
-        
-        参数：
-            observation: (balls, my_targets, table)
-        
-        返回：
-            dict: {'V0', 'phi', 'theta', 'a', 'b'}
-        """
-        return self._random_action()
