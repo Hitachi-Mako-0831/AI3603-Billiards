@@ -251,7 +251,7 @@ class NewAgent(Agent):
         return bool(centroid_ok and spread_ok)
 
     def _generate_break_candidates(self, balls, my_targets, table):
-        """开球候选（精简版）：只围绕球堆中心给少量、保守的直冲选项。
+        """开球候选：只围绕球堆中心给少量、保守的直冲选项。
 
         思路：
         - 估计球堆质心方向 phi_center。
@@ -507,7 +507,7 @@ class NewAgent(Agent):
         return mean - 0.35 * std
     
     def _filter_and_rank(self, candidates_with_scores):
-        """模块5: 决策与约束过滤"""
+        """模块4: 决策与约束过滤"""
         # 优先过滤掉“必然犯规/判负”的候选（analyze_shot_for_reward 会给到 ~-10000 或更低）
         non_catastrophic = [c for c in candidates_with_scores if c.get('score', -1e9) > -9_000]
         if non_catastrophic:
@@ -582,9 +582,9 @@ class NewAgent(Agent):
             # 模块3: 快速仿真与评分（两阶段：粗评 -> 鲁棒复评）
             all_candidates.sort(key=lambda c: c.get('estimated_difficulty', 0.0))
 
+            print(f"[HybridAgent] 开始评分 {len(all_candidates)} 个候选击球动作")
             stage1 = all_candidates[:min(18, len(all_candidates))]
             stage1_scored = []
-            print("[HybridAgent] 开始粗评候选动作...")
             for candidate in stage1:
                 score = self._fast_simulate_and_score(candidate, balls, my_targets, table, n_rollouts=1)
                 stage1_scored.append({**candidate, 'score': float(score)})
@@ -592,12 +592,11 @@ class NewAgent(Agent):
             stage1_scored.sort(key=lambda x: x['score'], reverse=True)
             stage2 = stage1_scored[:min(6, len(stage1_scored))]
             candidates_with_scores = []
-            print("[HybridAgent] 开始鲁棒复评Top候选...")
             for candidate in stage2:
                 score = self._fast_simulate_and_score(candidate, balls, my_targets, table, n_rollouts=3)
                 candidates_with_scores.append({**candidate, 'score': float(score)})
             
-            # 模块5: 过滤与决策
+            # 模块4: 过滤与决策
             best = self._filter_and_rank(candidates_with_scores)
             
             if best is None:

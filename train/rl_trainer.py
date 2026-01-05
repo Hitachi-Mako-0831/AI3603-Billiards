@@ -626,9 +626,9 @@ def create_rl_agent_wrapper(value_net_path: str):
     返回:
         配置好的 HybridAgent
     """
-    from agent import HybridAgent
+    from agents import NewAgent
 
-    agent = HybridAgent(use_value_network=True, value_net_path=value_net_path)
+    agent = NewAgent(use_value_network=True, value_net_path=value_net_path)
     return agent
 
 
@@ -648,7 +648,7 @@ def main():
 
     # 导入环境和agent
     from poolenv import PoolEnv
-    from agent import HybridAgent
+    from agents import NewAgent
 
     # 创建组件
     state_encoder = StateEncoder()
@@ -668,7 +668,7 @@ def main():
 
     self_play = SelfPlayManager(
         env_class=PoolEnv,
-        agent_class=HybridAgent,
+        agent_class=NewAgent,
         state_encoder=state_encoder,
         value_net=value_net
     )
