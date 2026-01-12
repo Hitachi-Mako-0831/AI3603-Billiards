@@ -11,7 +11,7 @@ try:
 except ImportError:
     signal = None # Windows compatible
 
-from concurrent.futures import ThreadPoolExecutor
+# from concurrent.futures import ThreadPoolExecutor
 # from poolagent.pool import Pool as CuetipEnv, State as CuetipState
 # from poolagent import FunctionAgent
 
@@ -358,40 +358,13 @@ class BasicAgent(Agent):
             seed = np.random.randint(1e6)
             optimizer = self._create_optimizer(reward_fn_wrapper, seed)
             
-            # Parallel Initial Search
-            # We manually generate random points and evaluate them in parallel
-            if self.INITIAL_SEARCH > 0:
-                print(f"    [Parallel] Evaluating {self.INITIAL_SEARCH} initial points...")
-                
-                # 1. Generate random points
-                random_points = []
-                for _ in range(self.INITIAL_SEARCH):
-                    params = {}
-                    for k, (low, high) in self.pbounds.items():
-                        params[k] = np.random.uniform(low, high)
-                    random_points.append(params)
-                    
-                # 2. Parallel Evaluation
-                # pooltool likely releases GIL in some C++ parts, so threading gives speedup
-                with ThreadPoolExecutor() as executor:
-                    futures = {executor.submit(reward_fn_wrapper, **p): p for p in random_points}
-                    
-                    for future in futures:
-                        params = futures[future]
-                        try:
-                            score = future.result()
-                            # 3. Register result to optimizer
-                            optimizer.register(params=params, target=score)
-                        except Exception as e:
-                            print(f"[Warning] Evaluation failed: {e}")
+            # Parallel Initial Search REMOVED
+            # We let the optimizer handle initial points sequentially
             
-            # Run remaining optimization steps sequentially
-            # init_points is 0 because we already registered initial points
-            if self.OPT_SEARCH > 0:
-                optimizer.maximize(
-                    init_points=0,
-                    n_iter=self.OPT_SEARCH
-                )
+            optimizer.maximize(
+                init_points=self.INITIAL_SEARCH,
+                n_iter=self.OPT_SEARCH
+            )
             
             best_result = optimizer.max
             best_params = best_result['params']

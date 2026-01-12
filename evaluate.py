@@ -13,21 +13,46 @@ evaluate.py - Agent 评估脚本
 """
 
 # 导入必要的模块
+import argparse
+import os
 from utils import set_random_seed
+import utils.eval_logger as eval_logger
 from poolenv import PoolEnv
-from agents import BasicAgent, BasicAgentPro, NewAgent
+from agents import BasicAgent, BasicAgentPro
+from agents.physics_agent import PhysicsAgent
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--opponent", type=str, default="basic", choices=["basic", "pro"])
+parser.add_argument("--n_games", type=int, default=120)
+parser.add_argument("--log_path", type=str, default=None)
+parser.add_argument("--fixed_seed", action="store_true")
+parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--no_safety_gate", action="store_true")
+parser.add_argument("--no_robust_rollout", action="store_true")
+parser.add_argument("--no_risk_shaping", action="store_true")
+parser.add_argument("--no_fallback", action="store_true")
+args = parser.parse_args()
+
+if args.log_path:
+    os.environ["EVAL_LOG_PATH"] = str(args.log_path)
 
 # 设置随机种子，enable=True 时使用固定种子，enable=False 时使用完全随机
 # 根据需求，我们在这里统一设置随机种子，确保 agent 双方的全局击球扰动使用相同的随机状态
-set_random_seed(enable=False, seed=42)
+set_random_seed(enable=bool(args.fixed_seed), seed=int(args.seed))
 
 env = PoolEnv()
 results = {'AGENT_A_WIN': 0, 'AGENT_B_WIN': 0, 'SAME': 0}
-n_games = 120  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
+n_games = int(args.n_games)  # 对战局数 自己测试时可以修改 扩充为120局为了减少随机带来的扰动
 
-## 选择对打的对手
-agent_a, agent_b = BasicAgent(), NewAgent() # 与 BasicAgent 对打
-# agent_a, agent_b = BasicAgentPro(), NewAgent() # 与 BasicAgentPro 对打
+agent_a = BasicAgent() if args.opponent == "basic" else BasicAgentPro()
+agent_b = PhysicsAgent(
+    cfg={
+        "no_safety_gate": bool(args.no_safety_gate),
+        "no_robust_rollout": bool(args.no_robust_rollout),
+        "no_risk_shaping": bool(args.no_risk_shaping),
+        "no_fallback": bool(args.no_fallback),
+    }
+)
 
 players = [agent_a, agent_b]  # 用于切换先后手
 target_ball_choice = ['solid', 'solid', 'stripe', 'stripe']  # 轮换球型
@@ -77,3 +102,4 @@ results['AGENT_A_SCORE'] = results['AGENT_A_WIN'] * 1 + results['SAME'] * 0.5
 results['AGENT_B_SCORE'] = results['AGENT_B_WIN'] * 1 + results['SAME'] * 0.5
 
 print("\n最终结果：", results)
+eval_logger.write_evaluation_log_summary(results)

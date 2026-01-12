@@ -95,42 +95,59 @@ class BilliardGymEnv(gym.Env):
         # take_shot 会返回一个 info dict
         shot_info = self.env.take_shot(real_action)
         
-        # 4. 计算 Reward (优化版)
+        # 4. 计算 Reward (优化版 - 适配新规则)
         reward = 0.0
         
-        # 检查是否进球
+        # 从 shot_info 获取详细事件
         my_pocketed = len(shot_info.get('ME_INTO_POCKET', []))
         enemy_pocketed = len(shot_info.get('ENEMY_INTO_POCKET', []))
         cue_pocketed = shot_info.get('WHITE_BALL_INTO_POCKET', False)
+        foul_first_hit = shot_info.get('FOUL_FIRST_HIT', False)
+        no_pocket_no_rail = shot_info.get('NO_POCKET_NO_RAIL', False)
         
-        # A. 基础进球奖励 (鼓励进球)
+        # --- A. 进球奖励 (Potting Rewards) ---
         if my_pocketed > 0:
-            reward += 10.0 * my_pocketed # 大幅增加进球奖励，引导 Agent 渴望进球
+            reward += 10.0 * my_pocketed # 鼓励进球 (原 20)
         
-        # B. 惩罚 (避免失误)
+        # --- B. 基础惩罚 (Basic Penalties) ---
         if enemy_pocketed > 0:
-            reward -= 5.0 * enemy_pocketed # 误进对手球
-        if cue_pocketed:
-            reward -= 5.0 # 白球进袋是严重失误
-            
-        # C. 稠密奖励 (Dense Reward) - 鼓励把球打散/打靠近洞口
-        # 这里只是一个简单的 heuristic：如果这一杆打到了自己的目标球，给一点点奖励
-        # 避免 Agent 只是乱打
-        touched_balls = shot_info.get('collisions', {}) # 需确认 poolenv 是否返回此信息，如果未返回暂不使用
-        # 暂时只用基础逻辑
+            reward -= 5.0 * enemy_pocketed # 误进对手球 (原 10)
         
+        # --- C. 犯规惩罚 (Foul Penalties - 关键优化) ---
+        if cue_pocketed:
+            reward -= 5.0 # 白球进袋 (原 20，因为已经丢了球权，不用罚太重)
+        
+        if foul_first_hit:
+            # 首球犯规
+            reward -= 2.0 # (原 15)
+            
+        if no_pocket_no_rail:
+            # 无进球且无碰库
+            reward -= 2.0 # (原 15)
+            
+        # --- D. 过程奖励 (Shaping Rewards) ---
+        # 1. 鼓励击打到球（减少空杆）
+        if not shot_info.get('NO_HIT', False):
+            reward += 0.5  # 只要碰到了球，就给一点奖励 (原 1)
+            
+        # 2. 鼓励合法击球（没有犯规）
+        is_foul = cue_pocketed or foul_first_hit or no_pocket_no_rail or shot_info.get('NO_HIT', False)
+        if not is_foul:
+            reward += 1.0 # 合法击球奖励 (原 2)
+            
+            # 如果虽然没进球，但是也没有给对手造成自由球机会（即合法），这本身就是一种成功
+            # 可以进一步细化：比如是否让母球停到了安全位置？暂时无法判断
+        
+        # --- E. 胜负奖励 (Game Outcome) ---
         # 5. 检查游戏是否结束 (Post-check after my shot)
         done, result = self.env.get_done()
         if done:
             if result['winner'] == self.my_player_id:
-                # 只有当是我自己打进去导致的赢球，才给巨大奖励
-                # 检查最后一杆是谁打的？如果是 opponent 回合赢的（对方失误），奖励少一点
-                # 但这里是 My Turn 结束后的检查，所以 winner == my_player_id 一定是我赢了
-                reward += 50.0 # 赢球奖励
-            elif result['winner'] == 'SAME': # 平局
+                reward += 50.0 # 赢球大奖 (原 100)
+            elif result['winner'] == 'SAME':
                 reward += 0.0
-            else: # 输了 (比如我把黑8打进去了但没清完球)
-                reward -= 50.0 # 输球给予较大惩罚
+            else: 
+                reward -= 20.0 # 输球惩罚 (原 50)
         
         # 6. 如果游戏未结束，且轮到对手，执行对手回合
         if not done and self.env.get_curr_player() == self.opponent_player_id:
@@ -140,7 +157,7 @@ class BilliardGymEnv(gym.Env):
              if opponent_stats['my_pocketed'] > 0:
                  # 对手进球越多，我们扣分越多，鼓励 Agent 尽量不要给对手留机会（防守策略）
                  # 但也不能扣太多，因为对手进球主要取决于对手实力
-                 reward -= 1.0 * opponent_stats['my_pocketed']
+                 reward -= 0.5 * opponent_stats['my_pocketed']
                  
              # 如果对手犯规了（比如白球进袋），这其实是我们的机会，可以给一点微小的奖励？
              # 不，对手犯规我们已经获得了球权，这已经是奖励了，不要重复奖励。
@@ -151,12 +168,12 @@ class BilliardGymEnv(gym.Env):
                  if result['winner'] == self.my_player_id:
                      # 对手蠢死了，把黑8打进去了，或者白球进袋输了
                      # 这种“躺赢”不应该给太多奖励，否则 Agent 会学会“等着对手自杀”
-                     reward += 10.0 # 躺赢给个辛苦费
+                     reward += 5.0 # 躺赢给个辛苦费 (原 10)
                  elif result['winner'] == 'SAME':
                      reward += 0.0
                  else:
                      # 对手正常打赢了
-                     reward -= 20.0 # 输给对手，惩罚适中（毕竟不是自己失误）
+                     reward -= 10.0 # 输给对手，惩罚适中 (原 20)
 
         obs = self._get_obs()
         terminated = done

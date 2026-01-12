@@ -101,7 +101,9 @@ ipython_config.py
 
 # Models and Checkpoints
 *.pth
-checkpoints/
+!checkpoints/
+checkpoints/**
+!checkpoints/ppo_final.pth
 
 .vscode/
 .idea/

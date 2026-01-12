@@ -12,6 +12,12 @@ class PhysicsAgent(Agent):
     """
     def __init__(self, cfg=None):
         super().__init__()
+        cfg = cfg or {}
+        self.enable_safety_gate = not bool(cfg.get("no_safety_gate", False))
+        self.enable_noise_rollouts = not bool(cfg.get("no_robust_rollout", False))
+        self.enable_risk_shaping = not bool(cfg.get("no_risk_shaping", False))
+        self.enable_fallback = not bool(cfg.get("no_fallback", False))
+
         self.ball_radius = 0.028575 # 台球标准半径 (米)
         self.top_k_candidates = 8
         self.mc_top_k = 5
@@ -201,7 +207,14 @@ class PhysicsAgent(Agent):
             if best is not None:
                 return best
         else:
-            return self._safe_fallback_action(balls, my_targets, table, target_ids)
+            if self.enable_fallback:
+                return self._safe_fallback_action(balls, my_targets, table, target_ids)
+            a = self._random_action_towards_ball(balls, target_ids)
+            a["V0"] = float(np.clip(float(a.get("V0", 1.6)), 0.5, 2.6))
+            a["theta"] = 0.0
+            a["a"] = 0.0
+            a["b"] = 0.0
+            return a
 
     def _is_obstructed(self, start_pos, end_pos, balls, exclude_ids):
         """
@@ -291,6 +304,8 @@ class PhysicsAgent(Agent):
         return remaining, False
 
     def _perturb_action(self, action, noise_scale: float = 1.0, std_override=None):
+        if not self.enable_noise_rollouts:
+            noise_scale = 0.0
         noise_scale = float(max(0.0, noise_scale))
         std = self.mc_noise_std if std_override is None else std_override
         noisy = {
@@ -371,25 +386,26 @@ class PhysicsAgent(Agent):
 
         eight_risk = False
         eight_risk_penalty = 0.0
-        if (not stage_is_eight) and (eight_before_pos is not None) and (eight_after_pos is not None):
-            eight_disp = float(np.linalg.norm(eight_after_pos - eight_before_pos))
-            dmin_before = None
-            dmin_after = None
-            for _pid, pocket in table.pockets.items():
-                ppos = np.array(pocket.center[:2])
-                db = float(np.linalg.norm(ppos - eight_before_pos))
-                da = float(np.linalg.norm(ppos - eight_after_pos))
-                if dmin_before is None or db < dmin_before:
-                    dmin_before = db
-                if dmin_after is None or da < dmin_after:
-                    dmin_after = da
-            if (dmin_after is not None) and (dmin_before is not None):
-                if (dmin_after <= float(self.eight_near_pocket_d2)) and (eight_disp >= 0.006):
-                    eight_risk = True
-                    eight_risk_penalty = max(eight_risk_penalty, 2800.0)
-                if (dmin_before - dmin_after) >= 0.05 and eight_disp >= 0.01:
-                    eight_risk = True
-                    eight_risk_penalty = max(eight_risk_penalty, 2400.0)
+        if self.enable_risk_shaping:
+            if (not stage_is_eight) and (eight_before_pos is not None) and (eight_after_pos is not None):
+                eight_disp = float(np.linalg.norm(eight_after_pos - eight_before_pos))
+                dmin_before = None
+                dmin_after = None
+                for _pid, pocket in table.pockets.items():
+                    ppos = np.array(pocket.center[:2])
+                    db = float(np.linalg.norm(ppos - eight_before_pos))
+                    da = float(np.linalg.norm(ppos - eight_after_pos))
+                    if dmin_before is None or db < dmin_before:
+                        dmin_before = db
+                    if dmin_after is None or da < dmin_after:
+                        dmin_after = da
+                if (dmin_after is not None) and (dmin_before is not None):
+                    if (dmin_after <= float(self.eight_near_pocket_d2)) and (eight_disp >= 0.006):
+                        eight_risk = True
+                        eight_risk_penalty = max(eight_risk_penalty, 2800.0)
+                    if (dmin_before - dmin_after) >= 0.05 and eight_disp >= 0.01:
+                        eight_risk = True
+                        eight_risk_penalty = max(eight_risk_penalty, 2400.0)
 
         events = shot.events
         first_contact_ball_id = None
@@ -451,34 +467,37 @@ class PhysicsAgent(Agent):
             if enemy_n >= 2:
                 score -= float(self.enemy_pocket_multi_penalty) * float(enemy_n - 1)
 
-        if (not stage_is_eight) and (eight_before_pos is not None) and (eight_after_pos is not None):
-            eight_disp = float(np.linalg.norm(eight_after_pos - eight_before_pos))
-            score -= float(self.eight_move_penalty) * eight_disp
+        if self.enable_risk_shaping:
+            if (not stage_is_eight) and (eight_before_pos is not None) and (eight_after_pos is not None):
+                eight_disp = float(np.linalg.norm(eight_after_pos - eight_before_pos))
+                score -= float(self.eight_move_penalty) * eight_disp
 
-        if (not stage_is_eight) and eight_risk:
-            remaining_n = int(len(stage_targets))
-            risk_pen = float(eight_risk_penalty)
-            if remaining_n <= 2:
-                risk_pen *= 1.4
-            score -= risk_pen
-            event_tag = "EIGHT_RISK"
+        if self.enable_risk_shaping:
+            if (not stage_is_eight) and eight_risk:
+                remaining_n = int(len(stage_targets))
+                risk_pen = float(eight_risk_penalty)
+                if remaining_n <= 2:
+                    risk_pen *= 1.4
+                score -= risk_pen
+                event_tag = "EIGHT_RISK"
 
-        if (not stage_is_eight) and cue_touched_eight:
-            touch_pen = float(self.cue8_touch_score_penalty)
-            remaining_n = int(len(stage_targets))
-            if remaining_n <= 2:
-                touch_pen *= 2.0
-            if eight_before_pos is not None:
-                dmin_before = None
-                for _pid, pocket in table.pockets.items():
-                    ppos = np.array(pocket.center[:2])
-                    db = float(np.linalg.norm(ppos - eight_before_pos))
-                    if dmin_before is None or db < dmin_before:
-                        dmin_before = db
-                if dmin_before is not None and dmin_before <= float(self.eight_near_pocket_d2):
+        if self.enable_risk_shaping:
+            if (not stage_is_eight) and cue_touched_eight:
+                touch_pen = float(self.cue8_touch_score_penalty)
+                remaining_n = int(len(stage_targets))
+                if remaining_n <= 2:
                     touch_pen *= 2.0
-            score -= touch_pen
-            event_tag = "CUE_TOUCH_8"
+                if eight_before_pos is not None:
+                    dmin_before = None
+                    for _pid, pocket in table.pockets.items():
+                        ppos = np.array(pocket.center[:2])
+                        db = float(np.linalg.norm(ppos - eight_before_pos))
+                        if dmin_before is None or db < dmin_before:
+                            dmin_before = db
+                    if dmin_before is not None and dmin_before <= float(self.eight_near_pocket_d2):
+                        touch_pen *= 2.0
+                score -= touch_pen
+                event_tag = "CUE_TOUCH_8"
 
         v0 = float(action.get("V0", 0.0))
         if not stage_is_eight:
@@ -528,6 +547,8 @@ class PhysicsAgent(Agent):
         return agg, best_sample_action
 
     def _passes_black_safety(self, action, balls, my_targets, table, stage_is_eight, samples_override=None):
+        if not self.enable_safety_gate:
+            return True
         stage_targets = None
         remaining_n = None
         eight_near = False
@@ -761,7 +782,7 @@ class PhysicsAgent(Agent):
                 a2["V0"] = float(np.clip(float(a2.get("V0", 0.0)) * float(scale), 0.5, 8.0))
                 if self._passes_black_safety(a2, balls, my_targets, table, stage_is_eight):
                     return a2
-            if not stage_is_eight:
+            if (not stage_is_eight) and self.enable_fallback:
                 return self._safe_fallback_action(balls, my_targets, table, _stage_targets)
             return base
 
@@ -770,7 +791,7 @@ class PhysicsAgent(Agent):
             a = candidates[0]['action']
             if self._passes_black_safety(a, balls, my_targets, table, stage_is_eight):
                 return a
-            if not stage_is_eight:
+            if (not stage_is_eight) and self.enable_fallback:
                 return self._safe_fallback_action(balls, my_targets, table, _stage_targets)
             return a
 
@@ -799,7 +820,7 @@ class PhysicsAgent(Agent):
             base = best_action_per[int(best_idx)]
             if self._passes_black_safety(base, balls, my_targets, table, stage_is_eight):
                 return base
-            if not stage_is_eight:
+            if (not stage_is_eight) and self.enable_fallback:
                 return self._safe_fallback_action(balls, my_targets, table, _stage_targets)
             return base
 
@@ -807,7 +828,7 @@ class PhysicsAgent(Agent):
         a = candidates[0]['action']
         if self._passes_black_safety(a, balls, my_targets, table, stage_is_eight):
             return a
-        if not stage_is_eight:
+        if (not stage_is_eight) and self.enable_fallback:
             return self._safe_fallback_action(balls, my_targets, table, _stage_targets)
         return a
 
