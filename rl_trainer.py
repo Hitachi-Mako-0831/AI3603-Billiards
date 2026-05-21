@@ -22,6 +22,8 @@ from collections import deque
 from pathlib import Path
 import json
 from datetime import datetime
+from typing import Optional
+from torch.utils.tensorboard import SummaryWriter
 
 
 class StateEncoder:
@@ -321,6 +323,26 @@ class ReplayBuffer:
         self.buffer = deque(data, maxlen=self.buffer.maxlen)
 
 
+class TrainingMonitor:
+    """简单的训练监控器，负责把关键指标写入 TensorBoard"""
+
+    def __init__(self, log_dir: Optional[str] = None):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_dir = Path(log_dir or f"runs/poolenv_{timestamp}")
+        self.writer = SummaryWriter(self.log_dir)
+
+    def log_scalar(self, name: str, value: float, step: int) -> None:
+        """写入标量，统一入口便于后续扩展"""
+        self.writer.add_scalar(name, value, step)
+
+    def flush(self) -> None:
+        self.writer.flush()
+
+    def close(self) -> None:
+        self.writer.flush()
+        self.writer.close()
+
+
 class RLTrainer:
     """强化学习训练器
 
@@ -433,7 +455,7 @@ class SelfPlayManager:
         """收集一局对弈数据
 
         返回:
-            winner: 'A' 或 'B'
+            winner: 'A'/'B'/'SAME'/None
             episode_length: 回合数
         """
         env = self.env_class(verbose=verbose, record_shots=False)
@@ -564,7 +586,8 @@ class SelfPlayManager:
         train_freq: int = 4,
         batch_size: int = 64,
         save_freq: int = 100,
-        save_dir: str = 'checkpoints'
+        save_dir: str = 'checkpoints',
+        monitor: Optional[TrainingMonitor] = None
     ):
         """运行训练循环
 
@@ -576,11 +599,13 @@ class SelfPlayManager:
             batch_size: 训练批大小
             save_freq: 保存频率
             save_dir: 保存目录
+            monitor: 监控器，写入 TensorBoard 日志
         """
         save_path = Path(save_dir)
         save_path.mkdir(exist_ok=True)
 
-        wins = {'A': 0, 'B': 0, None: 0}
+        # 可能的winner: 'A'/'B'/'SAME'/None
+        wins = {'A': 0, 'B': 0, 'SAME': 0, None: 0}
 
         print(f"开始训练，共 {num_episodes} 局...")
         print(f"设备: {trainer.device}")
@@ -594,6 +619,21 @@ class SelfPlayManager:
             if episode > 0 and episode % train_freq == 0:
                 for _ in range(train_freq):
                     loss = trainer.train_step_td(replay_buffer, batch_size)
+
+            last_loss = trainer.losses[-1] if trainer.losses else None
+
+            if monitor is not None:
+                step = episode + 1
+                monitor.log_scalar("buffer/size", float(len(replay_buffer)), step)
+                if last_loss is not None:
+                    monitor.log_scalar("train/loss", float(last_loss), step)
+                total_finished = wins['A'] + wins['B'] + wins['SAME']
+                if total_finished > 0:
+                    monitor.log_scalar("win_rate/A", wins['A'] / total_finished, step)
+                    monitor.log_scalar("win_rate/B", wins['B'] / total_finished, step)
+                    monitor.log_scalar("win_rate/SAME", wins['SAME'] / total_finished, step)
+                monitor.log_scalar("episode/length", float(length), step)
+                monitor.flush()
 
             # 打印进度
             if (episode + 1) % 10 == 0:
@@ -612,6 +652,8 @@ class SelfPlayManager:
 
         # 保存最终模型
         trainer.save(save_path / 'value_net_final.pt')
+        if monitor is not None:
+            monitor.flush()
         print("训练完成！")
 
         return wins
@@ -644,10 +686,12 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4, help="学习率")
     parser.add_argument("--save-dir", type=str, default="checkpoints", help="保存目录")
     parser.add_argument("--resume", type=str, default=None, help="从检查点恢复")
+    parser.add_argument("--log-dir", type=str, default=None, help="TensorBoard 日志目录 (默认 runs/poolenv_<时间戳>)")
+    parser.add_argument("--no-log", action="store_true", help="关闭 TensorBoard 记录")
     args = parser.parse_args()
 
     # 导入环境和agent
-    from poolenv import PoolEnv
+    from rl_env import PoolEnv
     from agents import NewAgent
 
     # 创建组件
@@ -666,6 +710,8 @@ def main():
         trainer.load(args.resume)
         print(f"从 {args.resume} 恢复训练")
 
+    monitor = None if args.no_log else TrainingMonitor(log_dir=args.log_dir)
+
     self_play = SelfPlayManager(
         env_class=PoolEnv,
         agent_class=NewAgent,
@@ -680,8 +726,12 @@ def main():
         num_episodes=args.episodes,
         train_freq=4,
         batch_size=args.batch_size,
-        save_dir=args.save_dir
+        save_dir=args.save_dir,
+        monitor=monitor
     )
+
+    if monitor is not None:
+        monitor.close()
 
     print(f"\n训练统计:")
     print(f"  Player A 胜场: {wins['A']}")

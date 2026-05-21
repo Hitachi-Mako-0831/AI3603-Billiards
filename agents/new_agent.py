@@ -163,6 +163,138 @@ def _first_ball_hit_by_ray(cue_pos: np.ndarray, balls: dict, phi_deg: float, cle
                 best_id = bid
     return best_id
 
+class StateEncoder:
+    """台球局面特征编码器 (从 rl_trainer.py 复制)"""
+
+    def __init__(self, max_balls=7):
+        self.max_balls = max_balls
+        self.feature_dim = 2 + 2 + 14 + 14 + 15 + 10  # = 57
+        self.table_length = 2.24
+        self.table_width = 1.12
+
+    def encode(self, balls, my_targets, table, pocket_positions=None):
+        features = []
+        if pocket_positions is None:
+            if hasattr(table, 'pockets') and table.pockets:
+                pocket_positions = [
+                    (float(p.center[0]), float(p.center[1]))
+                    for p in table.pockets.values()
+                ]
+            else:
+                L = getattr(table, 'l', 2.24)
+                W = getattr(table, 'w', 1.12)
+                pocket_positions = [
+                    (0.0, 0.0), (L/2, 0.0), (L, 0.0),
+                    (0.0, W), (L/2, W), (L, W),
+                ]
+
+        cue_pos = self._get_ball_pos(balls, 'cue')
+        features.extend(self._normalize_pos(cue_pos))
+
+        eight_pos = self._get_ball_pos(balls, '8')
+        features.extend(self._normalize_pos(eight_pos))
+
+        target_positions = []
+        for bid in my_targets:
+            if bid != '8':
+                pos = self._get_ball_pos(balls, bid)
+                target_positions.append(pos)
+
+        while len(target_positions) < self.max_balls:
+            target_positions.append((-1, -1))
+
+        for pos in target_positions[:self.max_balls]:
+            features.extend(self._normalize_pos(pos))
+
+        opponent_positions = []
+        for bid, ball in balls.items():
+            if bid not in my_targets and bid not in ['cue', '8']:
+                if ball.state.s != 4:
+                    pos = (ball.state.rvw[0][0], ball.state.rvw[0][1])
+                    opponent_positions.append(pos)
+
+        while len(opponent_positions) < self.max_balls:
+            opponent_positions.append((-1, -1))
+
+        for pos in opponent_positions[:self.max_balls]:
+            features.extend(self._normalize_pos(pos))
+
+        features.append(self._min_dist_to_pocket(cue_pos, pocket_positions))
+        for pos in target_positions[:self.max_balls]:
+            features.append(self._min_dist_to_pocket(pos, pocket_positions))
+        for pos in opponent_positions[:self.max_balls]:
+            features.append(self._min_dist_to_pocket(pos, pocket_positions))
+
+        stats = self._compute_stats(balls, my_targets, cue_pos, pocket_positions)
+        features.extend(stats)
+
+        return np.array(features, dtype=np.float32)
+
+    def _get_ball_pos(self, balls, ball_id):
+        if ball_id in balls and balls[ball_id].state.s != 4:
+            return (balls[ball_id].state.rvw[0][0], balls[ball_id].state.rvw[0][1])
+        return (-1, -1)
+
+    def _normalize_pos(self, pos):
+        if pos[0] < 0:
+            return [-1.0, -1.0]
+        x = (pos[0] / self.table_length) * 2 - 1
+        y = (pos[1] / self.table_width) * 2 - 1
+        return [np.clip(x, -1, 1), np.clip(y, -1, 1)]
+
+    def _min_dist_to_pocket(self, pos, pockets):
+        if pos[0] < 0:
+            return 1.0
+        min_dist = float('inf')
+        for pocket in pockets:
+            dist = np.sqrt((pos[0] - pocket[0])**2 + (pos[1] - pocket[1])**2)
+            min_dist = min(min_dist, dist)
+        return min(min_dist / 2.5, 1.0)
+
+    def _compute_stats(self, balls, my_targets, cue_pos, pockets):
+        stats = []
+        remaining_own = sum(1 for bid in my_targets
+                          if bid in balls and balls[bid].state.s != 4 and bid != '8')
+        stats.append(remaining_own / 7.0)
+
+        remaining_opp = sum(1 for bid, b in balls.items()
+                          if bid not in my_targets and bid not in ['cue', '8']
+                          and b.state.s != 4)
+        stats.append(remaining_opp / 7.0)
+
+        is_targeting_eight = 1.0 if (remaining_own == 0 or my_targets == ['8']) else 0.0
+        stats.append(is_targeting_eight)
+
+        min_dist_to_target = 1.0
+        for bid in my_targets:
+            if bid in balls and balls[bid].state.s != 4:
+                pos = (balls[bid].state.rvw[0][0], balls[bid].state.rvw[0][1])
+                if cue_pos[0] >= 0:
+                    dist = np.sqrt((cue_pos[0] - pos[0])**2 + (cue_pos[1] - pos[1])**2)
+                    min_dist_to_target = min(min_dist_to_target, dist / 2.5)
+        stats.append(min_dist_to_target)
+
+        avg_dist = 0.0
+        count = 0
+        for bid in my_targets:
+            if bid in balls and balls[bid].state.s != 4:
+                pos = (balls[bid].state.rvw[0][0], balls[bid].state.rvw[0][1])
+                avg_dist += self._min_dist_to_pocket(pos, pockets)
+                count += 1
+        stats.append(avg_dist / max(count, 1))
+
+        if cue_pos[0] >= 0:
+            dist_to_cushion = min(
+                cue_pos[0], self.table_length - cue_pos[0],
+                cue_pos[1], self.table_width - cue_pos[1]
+            )
+            stats.append(min(dist_to_cushion / 0.3, 1.0))
+        else:
+            stats.append(0.0)
+
+        stats.extend([0.0, 0.0, 0.0, 0.0])
+        return stats[:10]
+
 # ======= 混合架构Agent定义 ========
 class NewAgent(Agent):
     """混合架构Agent：规则生成候选 + 快速仿真 + 学习型评估"""
@@ -177,6 +309,7 @@ class NewAgent(Agent):
         super().__init__()
         self.use_value_network = use_value_network
         self.value_net = None
+        self.state_encoder = StateEncoder()
         
         if use_value_network and value_net_path:
             self._load_value_network(value_net_path)
@@ -199,21 +332,34 @@ class NewAgent(Agent):
             import torch.nn as nn
             
             class ValueNetwork(nn.Module):
-                def __init__(self, input_dim=128):
+                def __init__(self, input_dim=57, hidden_dims=[256, 128, 64]):
                     super().__init__()
-                    self.net = nn.Sequential(
-                        nn.Linear(input_dim, 256),
-                        nn.ReLU(),
-                        nn.Linear(256, 128),
-                        nn.ReLU(),
-                        nn.Linear(128, 1)
-                    )
+                    layers = []
+                    prev_dim = input_dim
+                    for hidden_dim in hidden_dims:
+                        layers.extend([
+                            nn.Linear(prev_dim, hidden_dim),
+                            nn.LayerNorm(hidden_dim),
+                            nn.ReLU(),
+                            nn.Dropout(0.1)
+                        ])
+                        prev_dim = hidden_dim
+                    layers.append(nn.Linear(prev_dim, 1))
+                    layers.append(nn.Sigmoid())
+                    self.network = nn.Sequential(*layers)
                 
                 def forward(self, x):
-                    return self.net(x)
+                    return self.network(x)
             
             self.value_net = ValueNetwork()
-            self.value_net.load_state_dict(torch.load(path))
+            checkpoint = torch.load(path, map_location='cpu')
+            
+            # 处理保存为字典的情况（包含优化器状态等）
+            if isinstance(checkpoint, dict) and 'value_net' in checkpoint:
+                self.value_net.load_state_dict(checkpoint['value_net'])
+            else:
+                self.value_net.load_state_dict(checkpoint)
+                
             self.value_net.eval()
             print(f"[HybridAgent] 成功加载评估网络: {path}")
         except Exception as e:
@@ -500,7 +646,27 @@ class NewAgent(Agent):
                 scores.append(-50_000.0)
                 continue
 
-            scores.append(analyze_shot_for_reward(shot, last_state, my_targets))
+            # 基础规则评分
+            rule_score = analyze_shot_for_reward(shot, last_state, my_targets)
+            
+            # 价值网络评分（仅在非严重犯规时启用）
+            value_score = 0.0
+            if self.use_value_network and self.value_net is not None and rule_score > -5000:
+                try:
+                    import torch
+                    # 提取新状态特征
+                    features = self.state_encoder.encode(shot.balls, my_targets, sim_table)
+                    features_tensor = torch.FloatTensor(features).unsqueeze(0)
+                    with torch.no_grad():
+                        value = self.value_net(features_tensor).item()
+                    
+                    # 价值网络输出 [0, 1]，映射到规则分数量级 (例如 0.5 -> 0, 1.0 -> +500)
+                    # 这里假设 value 代表胜率，胜率越高越好
+                    value_score = (value - 0.5) * 1000.0
+                except Exception as e:
+                    print(f"[HybridAgent] 价值评估出错: {e}")
+            
+            scores.append(rule_score + value_score)
 
         mean = float(np.mean(scores))
         std = float(np.std(scores))
