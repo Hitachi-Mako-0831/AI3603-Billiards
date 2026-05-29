@@ -2,3 +2,4 @@ pooltool-billiards
 numpy
 bayesian-optimization
 torch
+scikit-learn

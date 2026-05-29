@@ -436,7 +436,7 @@ class SelfPlayManager:
             winner: 'A' 或 'B'
             episode_length: 回合数
         """
-        env = self.env_class(verbose=verbose, record_shots=False)
+        env = self.env_class()
 
         # 创建两个agent
         agent_a = self.agent_class()
@@ -626,7 +626,7 @@ def create_rl_agent_wrapper(value_net_path: str):
     返回:
         配置好的 HybridAgent
     """
-    from agent import HybridAgent
+    from agents.new_agent import NewAgent as HybridAgent
 
     agent = HybridAgent(use_value_network=True, value_net_path=value_net_path)
     return agent
@@ -648,7 +648,7 @@ def main():
 
     # 导入环境和agent
     from poolenv import PoolEnv
-    from agent import HybridAgent
+    from agents.new_agent import NewAgent as HybridAgent
 
     # 创建组件
     state_encoder = StateEncoder()

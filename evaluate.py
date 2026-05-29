@@ -16,6 +16,7 @@ evaluate.py - Agent 评估脚本
 from utils import set_random_seed
 from poolenv import PoolEnv
 from agents import BasicAgent, BasicAgentPro, NewAgent
+import pooltool as pt
 
 # 设置随机种子，enable=True 时使用固定种子，enable=False 时使用完全随机
 # 根据需求，我们在这里统一设置随机种子，确保 agent 双方的全局击球扰动使用相同的随机状态
@@ -64,6 +65,9 @@ for i in range(n_games):
                 print(f"对方球入袋：{step_info['ENEMY_INTO_POCKET']}")
         if done:
             # 统计结果（player A/B 转换为 agent A/B） 
+            viewer = pt.ShotViewer()
+            viewer.show(env.shot_record, title=f"Game {i}: {len(env.shot_record)} shots")
+            
             if info['winner'] == 'SAME':
                 results['SAME'] += 1
             elif info['winner'] == 'A':
